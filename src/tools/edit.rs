@@ -15,8 +15,26 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> String {
-        "Performs exact string replacement in a file. The old_string must be unique \
-         in the file unless replace_all is true. Use this for targeted edits to existing files."
+        "Performs exact string replacements in files.\n\n\
+         REQUIRED parameters: \"file_path\" (string), \"old_string\" (string), \"new_string\" (string).\n\
+         Example: {\"file_path\": \"/path/to/file.rs\", \"old_string\": \"old code\", \"new_string\": \"new code\"}\n\n\
+         Usage:\n\
+         - You must use your `Read` tool at least once in the conversation before editing. \
+         This tool will error if you attempt an edit without reading the file. \n\
+         - When editing text from Read tool output, ensure you preserve the exact indentation \
+         (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix \
+         format is: spaces + line number + tab. Everything after that tab is the actual file \
+         content to match. Never include any part of the line number prefix in the old_string \
+         or new_string.\n\
+         - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless \
+         explicitly required.\n\
+         - Only use emojis if the user explicitly requests it. Avoid adding emojis to files \
+         unless asked.\n\
+         - The edit will FAIL if `old_string` is not unique in the file. Either provide a \
+         larger string with more surrounding context to make it unique or use `replace_all` \
+         to change every instance of `old_string`.\n\
+         - Use `replace_all` for replacing and renaming strings across the file. This parameter \
+         is useful if you want to rename a variable for instance."
             .to_string()
     }
 
@@ -26,19 +44,20 @@ impl Tool for EditTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute path to the file to edit"
+                    "description": "The absolute path to the file to modify"
                 },
                 "old_string": {
                     "type": "string",
-                    "description": "The exact text to find and replace"
+                    "description": "The text to replace"
                 },
                 "new_string": {
                     "type": "string",
-                    "description": "The replacement text"
+                    "description": "The text to replace it with (must be different from old_string)"
                 },
                 "replace_all": {
                     "type": "boolean",
-                    "description": "Replace all occurrences (default: false)"
+                    "description": "Replace all occurrences of old_string (default false)",
+                    "default": false
                 }
             },
             "required": ["file_path", "old_string", "new_string"]
@@ -74,7 +93,7 @@ impl Tool for EditTool {
 
         if !file_path.exists() {
             return Ok(ToolResult::error(format!(
-                "File not found: {}",
+                "File not found: {}. Read it again before attempting to write it.",
                 file_path.display()
             )));
         }
@@ -100,16 +119,35 @@ impl Tool for EditTool {
             }
         };
 
-        // Try with curly-quote normalization if exact match fails
+        // Try exact match first
         let occurrences = content.matches(old_string).count();
 
         if occurrences == 0 {
-            // Try normalizing curly quotes to straight quotes
+            // Try matching with curly quotes normalized to straight quotes
             let normalized_old = normalize_quotes(old_string);
             let normalized_content = normalize_quotes(&content);
             let norm_count = normalized_content.matches(&normalized_old).count();
 
             if norm_count > 0 {
+                // Try to find the actual string in the file that matches after normalization
+                if let Some(actual) = find_actual_string(&content, old_string) {
+                    // Do the replacement using the actual string found in the file
+                    let new_content = if replace_all {
+                        content.replace(&actual, new_string)
+                    } else {
+                        content.replacen(&actual, new_string, 1)
+                    };
+                    return match tokio::fs::write(&file_path, &new_content).await {
+                        Ok(()) => Ok(ToolResult::success(format!(
+                            "The file {} has been updated successfully.",
+                            file_path.display()
+                        ))),
+                        Err(e) => Ok(ToolResult::error(format!(
+                            "Failed to write {}: {}", file_path.display(), e
+                        ))),
+                    };
+                }
+
                 return Ok(ToolResult::error(format!(
                     "old_string not found exactly, but {} match(es) found after normalizing \
                      curly quotes. Please use straight quotes in old_string.",
@@ -117,9 +155,11 @@ impl Tool for EditTool {
                 )));
             }
 
+            // Check if file was modified since last read
             return Ok(ToolResult::error(format!(
                 "old_string not found in {}. Make sure the string matches exactly \
-                 (including whitespace and indentation).",
+                 (including whitespace and indentation). The file may have been modified \
+                 since you last read it — use the Read tool to get the current contents.",
                 file_path.display()
             )));
         }
@@ -139,17 +179,10 @@ impl Tool for EditTool {
         };
 
         match tokio::fs::write(&file_path, &new_content).await {
-            Ok(()) => {
-                let replaced = if replace_all {
-                    format!("Replaced {occurrences} occurrence(s)")
-                } else {
-                    "Replaced 1 occurrence".to_string()
-                };
-                Ok(ToolResult::success(format!(
-                    "{replaced} in {}",
-                    file_path.display()
-                )))
-            }
+            Ok(()) => Ok(ToolResult::success(format!(
+                "The file {} has been updated successfully.",
+                file_path.display()
+            ))),
             Err(e) => Ok(ToolResult::error(format!(
                 "Failed to write {}: {}",
                 file_path.display(),
@@ -165,4 +198,24 @@ fn normalize_quotes(s: &str) -> String {
         .replace('\u{2019}', "'")
         .replace('\u{201C}', "\"")
         .replace('\u{201D}', "\"")
+}
+
+/// Try to find the actual string in the file content that matches old_string
+/// after curly quote normalization. Returns the actual (un-normalized) string.
+fn find_actual_string(content: &str, old_string: &str) -> Option<String> {
+    let normalized_old = normalize_quotes(old_string);
+    let normalized_content = normalize_quotes(content);
+
+    if let Some(pos) = normalized_content.find(&normalized_old) {
+        // Map the byte position back to the original content
+        // This is approximate but works for quote substitutions (same char count)
+        let end = pos + normalized_old.len();
+        if end <= content.len() {
+            Some(content[pos..end].to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    }
 }

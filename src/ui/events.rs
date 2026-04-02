@@ -1,10 +1,36 @@
 /// Event types for channel communication between the tokio main thread and
 /// the smol/iocraft UI thread.
 
+/// Structured permission detail for the UI to render nicely.
+#[derive(Debug, Clone)]
+pub struct PermissionDetail {
+    /// Tool name (e.g. "Edit", "Bash", "Write")
+    pub tool: String,
+    /// File path or target (if applicable)
+    pub target: String,
+    /// One-line summary (e.g. "Overwrite foo.rs (42 lines)")
+    pub summary: String,
+    /// Diff lines for display
+    pub diff_lines: Vec<DiffLine>,
+}
+
+/// A single line in a diff/preview display.
+#[derive(Debug, Clone)]
+pub enum DiffLine {
+    /// Removed line (shown in red with -)
+    Remove(String),
+    /// Added line (shown in green with +)
+    Add(String),
+    /// Context/info line (shown dimmed)
+    Context(String),
+}
+
 /// Events sent from the main (tokio) thread to the UI (smol/iocraft) thread.
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     // --- Streaming ---
+    /// API call started — show thinking indicator until first token arrives.
+    InferenceStart,
     /// A chunk of streamed text from the API.
     StreamText(String),
     /// The model started invoking a tool during streaming.
@@ -45,10 +71,7 @@ pub enum UiEvent {
 
     // --- Control ---
     /// Show a permission prompt to the user.
-    PermissionPrompt {
-        tool: String,
-        description: String,
-    },
+    PermissionPrompt(PermissionDetail),
     /// A system/status message (warnings, info, verbose messages).
     StatusMessage {
         text: String,

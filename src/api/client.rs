@@ -194,23 +194,22 @@ impl ApiClient {
             tool_choice,
         };
 
-        // Debug: log request summary when ARCEE_DEBUG=1
-        if std::env::var("ARCEE_DEBUG").is_ok() {
-            eprintln!("\x1b[90m[DEBUG] API request: model={}, messages={}, tools={}\x1b[0m",
-                request.model,
-                request.messages.len(),
-                request.tools.len(),
+        tracing::debug!(
+            model = %request.model,
+            messages = request.messages.len(),
+            tools = request.tools.len(),
+            "API request"
+        );
+        for tool in &request.tools {
+            tracing::trace!(
+                name = %tool.function.name,
+                params = %serde_json::to_string(&tool.function.parameters)
+                    .unwrap_or_default()
+                    .chars()
+                    .take(200)
+                    .collect::<String>(),
+                "  tool"
             );
-            for tool in &request.tools {
-                eprintln!("\x1b[90m[DEBUG]   tool: {} (params: {})\x1b[0m",
-                    tool.function.name,
-                    serde_json::to_string(&tool.function.parameters)
-                        .unwrap_or_default()
-                        .chars()
-                        .take(200)
-                        .collect::<String>()
-                );
-            }
         }
 
         let mut stream = with_retry(&retry_config, || {
@@ -223,6 +222,9 @@ impl ApiClient {
         let mut notified_tool_calls: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
 
+        let stream_start = std::time::Instant::now();
+        let mut chunk_count = 0u64;
+
         while let Some(chunk_result) = stream.next().await {
             // Check escape flag during streaming — break immediately so the
             // stream is dropped (cancelling the HTTP connection, like AbortController.abort())
@@ -233,11 +235,19 @@ impl ApiClient {
             }
 
             let chunk = chunk_result?;
+            chunk_count += 1;
 
             // Emit streaming callbacks before accumulating
             for choice in &chunk.choices {
                 if let Some(ref delta) = choice.delta {
                     if let Some(ref content) = delta.content {
+                        tracing::debug!(
+                            elapsed_ms = stream_start.elapsed().as_millis() as u64,
+                            chunk = chunk_count,
+                            chars = content.len(),
+                            text = &content[..content.len().min(40)],
+                            "stream token"
+                        );
                         on_text(content);
                     }
                     if let Some(ref tool_calls) = delta.tool_calls {
@@ -259,23 +269,21 @@ impl ApiClient {
             accum.process_chunk(&chunk);
         }
 
-        // Debug: log accumulated tool calls before converting
-        if std::env::var("ARCEE_DEBUG").is_ok() {
-            for (i, tc) in accum.tool_calls.iter().enumerate() {
-                eprintln!(
-                    "\x1b[90m[DEBUG] tool_call[{i}]: name={:?}, id={:?}, args_len={}, args={:?}\x1b[0m",
-                    tc.name,
-                    tc.id,
-                    tc.arguments.len(),
-                    &tc.arguments[..tc.arguments.len().min(300)]
-                );
-            }
-            eprintln!(
-                "\x1b[90m[DEBUG] finish_reason={:?}, text_len={}\x1b[0m",
-                accum.finish_reason,
-                accum.text.len()
+        for (i, tc) in accum.tool_calls.iter().enumerate() {
+            tracing::debug!(
+                index = i,
+                name = %tc.name,
+                id = %tc.id,
+                args_len = tc.arguments.len(),
+                args = &tc.arguments[..tc.arguments.len().min(300)],
+                "tool_call"
             );
         }
+        tracing::debug!(
+            finish_reason = ?accum.finish_reason,
+            text_len = accum.text.len(),
+            "stream complete"
+        );
 
         let usage = accum.usage.clone();
         let finish_reason = accum.finish_reason.clone();
@@ -290,10 +298,9 @@ impl ApiClient {
         } else if let Some(ref reason) = finish_reason {
             StopReason::from_api(reason)
         } else {
-            // No finish_reason received — stream may have ended prematurely
-            eprintln!(
-                "\x1b[33m[warning: stream ended without finish_reason]\x1b[0m"
-            );
+            // No finish_reason received — stream may have ended prematurely.
+            // This is common with some API implementations, so only log in debug.
+            tracing::debug!("stream ended without finish_reason");
             StopReason::EndTurn
         };
 

@@ -6,7 +6,6 @@ use crate::messages::types::*;
 use crate::tools::{Tool, ToolContext, ToolRegistry, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
-use colored::Colorize;
 use serde_json::json;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -115,10 +114,16 @@ impl AgentTool {
         let (registry, sub_config, child_context, system_prompt) =
             build_agent_setup(agent_type, context).await;
 
+        // Fire SubagentStart hook
+        crate::hooks::run_event_hooks(
+            &context.config.hooks,
+            "SubagentStart",
+            json!({ "agent_type": agent_type, "prompt": prompt }),
+            &context.cwd,
+        ).await;
+
         let mut messages = vec![Message::user_text(prompt)];
         let mut cost_tracker = CostTracker::with_pricing(context.config.pricing_table.clone());
-
-        println!("\n  [Agent ({agent_type}): starting sub-agent]");
 
         let sub_escape = Arc::new(AtomicBool::new(false));
         let result = engine::query_loop(
@@ -131,8 +136,17 @@ impl AgentTool {
             &sub_escape,
             Some(&system_prompt),
             None, // sub-agents use direct print, no bridge
+            crate::output::OutputFormat::Text,
         )
         .await;
+
+        // Fire SubagentStop hook
+        crate::hooks::run_event_hooks(
+            &context.config.hooks,
+            "SubagentStop",
+            json!({ "agent_type": agent_type, "success": result.is_ok() }),
+            &context.cwd,
+        ).await;
 
         if let Err(ref e) = result {
             return Ok(ToolResult::error(format!("Sub-agent error: {e}")));
@@ -170,15 +184,7 @@ impl AgentTool {
         let pricing = context.config.pricing_table.clone();
         let bg_store = context.background_tasks.clone();
         let task_id_clone = task_id.clone();
-        let agent_type_owned = agent_type.to_string();
-
-        println!(
-            "\n  {}",
-            format!(
-                "[Agent ({agent_type_owned}): launched in background as task #{task_id}]"
-            )
-            .cyan()
-        );
+        let _agent_type_owned = agent_type.to_string();
 
         // Spawn detached tokio task — runs independently of the main conversation
         tokio::spawn(async move {
@@ -196,6 +202,7 @@ impl AgentTool {
                 &sub_escape,
                 Some(&system_prompt),
                 None, // background agents use direct print, no bridge
+                crate::output::OutputFormat::Text,
             )
             .await;
 
@@ -215,14 +222,8 @@ impl AgentTool {
                 }
             }
 
-            eprintln!(
-                "{}",
-                format!(
-                    "\n  [Background agent #{} ({}) completed]",
-                    task_id_clone, agent_type_owned
-                )
-                .cyan()
-            );
+            // Completion is reported via background task store and UI events —
+            // no need to print here (would garble iocraft UI).
         });
 
         Ok(ToolResult::success(format!(

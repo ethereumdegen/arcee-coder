@@ -242,7 +242,12 @@ pub struct CliOverrides {
     pub budget: Option<f64>,
     pub verbose: bool,
     pub resume: bool,
+    pub resume_session_id: Option<String>,
     pub prompt: Option<String>,
     pub no_auto_route: bool,
     pub permission_strictness: Option<PermissionStrictness>,
+    pub system_prompt: Option<String>,
+    pub append_system_prompt: Option<String>,
+    pub print_mode: bool,
+    pub output_format: Option<String>,
 }

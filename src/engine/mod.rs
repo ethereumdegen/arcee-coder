@@ -8,6 +8,7 @@ use crate::api::types::*;
 use crate::config::Config;
 use crate::messages::normalize::normalize_for_api;
 use crate::messages::types::*;
+use crate::output::{OutputFormat, StreamEvent};
 use crate::permissions;
 use crate::tools::{ToolContext, ToolRegistry};
 use crate::ui::bridge::UiBridge;
@@ -107,6 +108,7 @@ pub async fn query_loop(
     escape_flag: &Arc<AtomicBool>,
     system_prompt_override: Option<&str>,
     bridge: Option<&UiBridge>,
+    output_format: OutputFormat,
 ) -> Result<()> {
     let system_prompt = match system_prompt_override {
         Some(prompt) => prompt.to_string(),
@@ -122,6 +124,7 @@ pub async fn query_loop(
     let mut repeated_tool_count: usize = 0;
     let mut empty_end_turn_count: u32 = 0;
     let mut empty_response_fallback_model: Option<String> = None;
+    let mut validation_failure_fallback_model: Option<String> = None;
 
     loop {
         // Check escape flag
@@ -185,6 +188,12 @@ pub async fn query_loop(
         {
             let before = messages.len();
             out.status_dim("[auto-compacting conversation...]");
+            crate::hooks::run_event_hooks(
+                &config.hooks,
+                "PreCompact",
+                serde_json::json!({ "message_count": before, "estimated_tokens": estimated_tokens }),
+                &tool_context.cwd,
+            ).await;
             *messages = compact::compact_messages_ai(
                 client,
                 model_router::MODEL_LIGHT,
@@ -192,18 +201,25 @@ pub async fn query_loop(
                 AUTO_COMPACT_KEEP_RECENT,
             )
             .await;
+            let after_tokens = compact::estimate_tokens(messages);
+            crate::hooks::run_event_hooks(
+                &config.hooks,
+                "PostCompact",
+                serde_json::json!({ "message_count_before": before, "message_count_after": messages.len(), "estimated_tokens": after_tokens }),
+                &tool_context.cwd,
+            ).await;
             if config.verbose {
                 out.status_dim(&format!(
                     "[auto-compact: {} → {} messages, ~{} tokens]",
                     before,
                     messages.len(),
-                    compact::estimate_tokens(messages)
+                    after_tokens
                 ));
             }
         }
 
-        // Adaptive model selection
-        let model = match empty_response_fallback_model.take() {
+        // Adaptive model selection — escalate to heavy on validation failures or empty responses
+        let model = match validation_failure_fallback_model.take().or_else(|| empty_response_fallback_model.take()) {
             Some(fallback) => fallback,
             None => model_router::pick_model(
                 &config.model,
@@ -219,11 +235,15 @@ pub async fn query_loop(
             out.status_dim(&format!("[model: {model}]"));
         }
 
-        // Send model/turn info to UI
+        // Send model/turn info to UI and signal inference start
         if let Some(b) = bridge {
             b.model_info(&model);
             b.turn_info(turns, config.max_turns);
+            b.inference_start();
         }
+
+        // Create markdown renderer for this turn (shared via Mutex for closure capture)
+        let md_renderer = std::sync::Mutex::new(crate::ui::markdown::MarkdownRenderer::new());
 
         // Retry loop for transient API errors
         let mut api_retries = 0u32;
@@ -241,25 +261,43 @@ pub async fn query_loop(
                 std::sync::Mutex::new(None)
             };
 
+            let md = &md_renderer;
             let mut on_text = move |text: &str| {
                 if let Some(ref b) = bridge_for_text {
+                    // Bridge mode: pass raw text — iocraft handles its own rendering
                     b.stream_text(text);
                 } else {
-                    if let Ok(mut guard) = thinking.lock() {
-                        if let Some(indicator) = guard.take() {
-                            indicator.stop();
+                    match output_format {
+                        OutputFormat::StreamJson => {
+                            StreamEvent::text(text).emit();
+                        }
+                        OutputFormat::Json => {
+                            // Suppress streaming output; will emit final JSON at end
+                        }
+                        OutputFormat::Text => {
+                            if let Ok(mut guard) = thinking.lock() {
+                                if let Some(indicator) = guard.take() {
+                                    indicator.stop();
+                                }
+                            }
+                            // Render markdown for terminal output
+                            if let Ok(mut renderer) = md.lock() {
+                                let formatted = renderer.push_text(text);
+                                print!("{formatted}");
+                            } else {
+                                print!("{text}");
+                            }
+                            use std::io::Write;
+                            let _ = std::io::stdout().flush();
                         }
                     }
-                    print!("{text}");
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
                 }
             };
 
             let mut on_tool_start = move |id: &str, name: &str| {
                 if let Some(ref b) = bridge_for_tool {
                     b.stream_tool_start(id, name);
-                } else {
+                } else if output_format == OutputFormat::Text {
                     println!("\n{} {}", "Tool:".cyan().bold(), name.cyan());
                 }
             };
@@ -312,6 +350,18 @@ pub async fn query_loop(
                 }
             }
         };
+
+        // Flush markdown renderer after streaming completes (only for direct terminal output)
+        if bridge.is_none() && output_format == OutputFormat::Text {
+            if let Ok(mut renderer) = md_renderer.lock() {
+                let remaining = renderer.flush();
+                if !remaining.is_empty() {
+                    print!("{remaining}");
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                }
+            }
+        }
 
         cost_tracker.add_usage(&usage);
 
@@ -401,6 +451,13 @@ pub async fn query_loop(
                 out.status_dim(&format!(
                     "[loop exit: model returned end_turn at turn {turns}]"
                 ));
+                // Fire Stop hook
+                crate::hooks::run_event_hooks(
+                    &config.hooks,
+                    "Stop",
+                    serde_json::json!({ "reason": "end_turn", "turn": turns }),
+                    &tool_context.cwd,
+                ).await;
             }
             break;
         }
@@ -510,6 +567,7 @@ pub async fn query_loop(
             }
 
             let mut results = Vec::new();
+            let mut had_validation_failure = false;
 
             for (id, name, input) in &tool_uses {
                 // Check escape between tool calls
@@ -537,6 +595,7 @@ pub async fn query_loop(
                         "[tool '{name}' input validation failed: {validation_error}]"
                     ));
                     results.push((id.clone(), validation_error, true));
+                    had_validation_failure = true;
                     continue;
                 }
 
@@ -564,21 +623,11 @@ pub async fn query_loop(
                     permissions::PermissionResult::Ask => {
                         // Route permission prompt through bridge if available
                         if let Some(b) = bridge {
-                            let desc = input["description"]
-                                .as_str()
-                                .unwrap_or("")
-                                .to_string();
-                            let tool_desc = format!(
-                                "{name}: {}",
-                                serde_json::to_string(input)
-                                    .unwrap_or_default()
-                                    .chars()
-                                    .take(200)
-                                    .collect::<String>()
-                            );
+                            let detail =
+                                permissions::build_permission_detail(name, input);
                             // block_in_place so tokio background tasks keep running
                             let allowed_by_user = tokio::task::block_in_place(|| {
-                                b.prompt_permission(&tool_desc, &desc)
+                                b.prompt_permission(detail)
                             });
                             if allowed_by_user {
                                 true
@@ -678,7 +727,10 @@ pub async fn query_loop(
                                     result.is_error,
                                     duration_ms,
                                 );
-                            } else {
+                            } else if output_format == OutputFormat::StreamJson {
+                                StreamEvent::tool_use(name, input).emit();
+                                StreamEvent::tool_result(name, &preview, result.is_error).emit();
+                            } else if output_format == OutputFormat::Text {
                                 out.tool_result(&preview, result.is_error);
                                 if result.content.len() > 500 {
                                     out.status_dim(&format!(
@@ -720,6 +772,13 @@ pub async fn query_loop(
             // Add tool results as user message
             if !results.is_empty() {
                 messages.push(Message::tool_results(results));
+            }
+
+            // If tool validation failed and we used the light model, escalate to heavy
+            if had_validation_failure && model == model_router::MODEL_LIGHT {
+                out.status_dim("[validation failure on light model, escalating to heavy]");
+                validation_failure_fallback_model =
+                    Some(model_router::MODEL_HEAVY.to_string());
             }
         } else {
             last_tool_names.clear();

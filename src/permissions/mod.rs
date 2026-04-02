@@ -426,6 +426,109 @@ fn summarize_input(tool_name: &str, input: &serde_json::Value) -> String {
     }
 }
 
+/// Build a structured `PermissionDetail` for the interactive UI.
+pub fn build_permission_detail(
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> crate::ui::events::PermissionDetail {
+    use crate::ui::events::{DiffLine, PermissionDetail};
+
+    match tool_name {
+        "Edit" => {
+            let path = input["file_path"].as_str().unwrap_or("").to_string();
+            let old = input["old_string"].as_str().unwrap_or("");
+            let new = input["new_string"].as_str().unwrap_or("");
+            let replace_all = input["replace_all"].as_bool().unwrap_or(false);
+
+            let summary = if replace_all {
+                format!("{path} (replace all)")
+            } else {
+                path.clone()
+            };
+
+            let mut diff_lines = Vec::new();
+            for line in old.lines() {
+                diff_lines.push(DiffLine::Remove(line.to_string()));
+            }
+            for line in new.lines() {
+                diff_lines.push(DiffLine::Add(line.to_string()));
+            }
+
+            PermissionDetail {
+                tool: tool_name.to_string(),
+                target: path,
+                summary,
+                diff_lines,
+            }
+        }
+        "Write" => {
+            let path = input["file_path"].as_str().unwrap_or("").to_string();
+            let content = input["content"].as_str().unwrap_or("");
+            let is_new = !std::path::Path::new(&path).exists();
+            let action = if is_new { "Create" } else { "Overwrite" };
+            let line_count = content.lines().count();
+            let summary = format!("{action} ({line_count} lines, {} bytes)", content.len());
+
+            let mut diff_lines = Vec::new();
+            let lines: Vec<&str> = content.lines().collect();
+            let show = lines.len().min(PREVIEW_MAX_LINES);
+            for line in &lines[..show] {
+                if is_new {
+                    diff_lines.push(DiffLine::Add(line.to_string()));
+                } else {
+                    diff_lines.push(DiffLine::Context(line.to_string()));
+                }
+            }
+            if lines.len() > PREVIEW_MAX_LINES {
+                diff_lines.push(DiffLine::Context(format!(
+                    "... ({} more lines)",
+                    lines.len() - PREVIEW_MAX_LINES
+                )));
+            }
+
+            PermissionDetail {
+                tool: tool_name.to_string(),
+                target: path,
+                summary,
+                diff_lines,
+            }
+        }
+        "Bash" => {
+            let cmd = input["command"].as_str().unwrap_or("").to_string();
+            let desc = input["description"].as_str().unwrap_or("").to_string();
+            let summary = if desc.is_empty() {
+                cmd.clone()
+            } else {
+                desc
+            };
+            let mut diff_lines = Vec::new();
+            for line in cmd.lines() {
+                diff_lines.push(DiffLine::Context(line.to_string()));
+            }
+
+            PermissionDetail {
+                tool: tool_name.to_string(),
+                target: String::new(),
+                summary,
+                diff_lines,
+            }
+        }
+        _ => {
+            let summary = serde_json::to_string(input)
+                .unwrap_or_default()
+                .chars()
+                .take(300)
+                .collect::<String>();
+            PermissionDetail {
+                tool: tool_name.to_string(),
+                target: String::new(),
+                summary,
+                diff_lines: Vec::new(),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

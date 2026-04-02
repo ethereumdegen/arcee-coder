@@ -13,6 +13,8 @@ pub struct SseStream {
     buffer: String,
     /// Leftover bytes from a partial UTF-8 sequence at a chunk boundary.
     utf8_remainder: Vec<u8>,
+    /// Parsed events ready to be yielded (buffered from a single network chunk).
+    pending: std::collections::VecDeque<Result<ChatCompletionResponse, ApiError>>,
 }
 
 impl SseStream {
@@ -21,6 +23,7 @@ impl SseStream {
             inner: Box::pin(byte_stream),
             buffer: String::new(),
             utf8_remainder: Vec::new(),
+            pending: std::collections::VecDeque::new(),
         }
     }
 
@@ -92,9 +95,15 @@ impl Stream for SseStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            let chunks = self.parse_chunks();
-            if let Some(chunk) = chunks.into_iter().next() {
+            // Drain any already-parsed events first before reading more from the network.
+            if let Some(chunk) = self.pending.pop_front() {
                 return Poll::Ready(Some(chunk));
+            }
+
+            let chunks = self.parse_chunks();
+            if !chunks.is_empty() {
+                self.pending.extend(chunks);
+                continue;
             }
 
             match self.inner.as_mut().poll_next(cx) {
@@ -136,8 +145,9 @@ impl Stream for SseStream {
                     if !self.buffer.trim().is_empty() {
                         self.buffer.push('\n');
                         let chunks = self.parse_chunks();
-                        if let Some(chunk) = chunks.into_iter().next() {
-                            return Poll::Ready(Some(chunk));
+                        if !chunks.is_empty() {
+                            self.pending.extend(chunks);
+                            continue;
                         }
                     }
                     return Poll::Ready(None);
@@ -273,22 +283,20 @@ impl StreamAccumulator {
         // Add tool calls
         for tc in self.tool_calls {
             let input = if tc.arguments.trim().is_empty() {
-                eprintln!(
-                    "\x1b[33m[warning: tool '{}' called with empty arguments]\x1b[0m",
-                    tc.name
-                );
+                // Empty arguments — use empty object; the engine's input
+                // validation will report this to the model.
                 serde_json::Value::Object(serde_json::Map::new())
             } else {
                 match serde_json::from_str(&tc.arguments) {
                     Ok(v) => v,
-                    Err(e) => {
-                        eprintln!(
-                            "\x1b[33m[warning: tool '{}' arguments failed to parse: {e}]\x1b[0m",
-                            tc.name
-                        );
-                        eprintln!(
-                            "\x1b[33m  raw arguments: {}\x1b[0m",
-                            &tc.arguments[..tc.arguments.len().min(200)]
+                    Err(_e) => {
+                        // Parse failure — use empty object; the engine's input
+                        // validation will catch missing required fields.
+                        tracing::warn!(
+                            tool = %tc.name,
+                            error = %_e,
+                            raw = &tc.arguments[..tc.arguments.len().min(200)],
+                            "tool arguments failed to parse"
                         );
                         serde_json::Value::Object(serde_json::Map::new())
                     }

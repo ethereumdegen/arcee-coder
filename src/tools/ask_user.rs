@@ -40,12 +40,22 @@ impl Tool for AskUserTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'question' parameter"))?;
 
-        // Print the question
+        // In interactive (iocraft) mode, stdin is in raw mode and managed by the UI thread.
+        // We cannot safely read from it here. Instead, surface the question as the tool result
+        // so the model includes it in its output; the user will see it and respond naturally.
+        if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
+            return Ok(ToolResult::success(format!(
+                "QUESTION FOR USER: {question}\n\n\
+                 (The question has been displayed. Stop here and wait for the user to respond \
+                 in their next message.)"
+            )));
+        }
+
+        // Non-interactive (oneshot) mode: read from stdin directly.
         println!("\n{}", question);
         print!("> ");
         io::stdout().flush()?;
 
-        // Read user input
         let mut response = String::new();
         io::stdin().read_line(&mut response)?;
         let response = response.trim().to_string();

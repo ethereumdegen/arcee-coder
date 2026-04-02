@@ -1,9 +1,11 @@
 /// Bridge between the tokio main thread and the smol/iocraft UI thread.
 ///
-/// Uses crossbeam-channel for thread-safe, runtime-agnostic communication.
+/// Events (main→UI) use `smol::channel` so the UI future can `.await` on
+/// the receiver and wake instantly — no timer-based polling needed.
+/// Commands (UI→main) keep crossbeam for sync blocking on the tokio side.
 
 use crate::ui::events::{StatusLevel, UiCommand, UiEvent};
-use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, TryRecvError};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -11,14 +13,14 @@ use std::sync::Arc;
 /// receive commands back.
 #[derive(Clone)]
 pub struct UiBridge {
-    event_tx: Sender<UiEvent>,
-    command_rx: Receiver<UiCommand>,
+    event_tx: smol::channel::Sender<UiEvent>,
+    command_rx: CbReceiver<UiCommand>,
 }
 
 impl UiBridge {
     /// Create a new bridge pair: (main-side handle, ui-side handle).
     pub fn new(escape_flag: Arc<AtomicBool>) -> (Self, UiHandle) {
-        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = smol::channel::unbounded();
         let (command_tx, command_rx) = crossbeam_channel::unbounded();
 
         let bridge = UiBridge {
@@ -37,7 +39,12 @@ impl UiBridge {
 
     /// Send a UI event (non-blocking).
     pub fn send(&self, event: UiEvent) {
-        let _ = self.event_tx.send(event);
+        let _ = self.event_tx.send_blocking(event);
+    }
+
+    /// Notify UI that an API call is starting (show thinking indicator).
+    pub fn inference_start(&self) {
+        self.send(UiEvent::InferenceStart);
     }
 
     /// Send streamed text to the UI.
@@ -111,24 +118,6 @@ impl UiBridge {
         }
     }
 
-    /// Check if ESC was pressed (drains the command queue looking for EscapePressed).
-    pub fn check_escape(&self) -> bool {
-        // Non-destructively check — but crossbeam doesn't support peek,
-        // so we drain and re-check. Since ESC is an immediate action,
-        // we just check try_recv.
-        match self.command_rx.try_recv() {
-            Ok(UiCommand::EscapePressed) => true,
-            Ok(other) => {
-                // Put it back? No, crossbeam doesn't support that.
-                // For now, non-escape commands during streaming are dropped.
-                // This is acceptable since user input only matters at the prompt.
-                drop(other);
-                false
-            }
-            Err(_) => false,
-        }
-    }
-
     /// Request the UI to show the input prompt.
     pub fn show_prompt(&self) {
         self.send(UiEvent::ShowPrompt);
@@ -146,11 +135,8 @@ impl UiBridge {
     }
 
     /// Send a permission prompt to the UI and block until the user responds.
-    pub fn prompt_permission(&self, tool: &str, description: &str) -> bool {
-        self.send(UiEvent::PermissionPrompt {
-            tool: tool.to_string(),
-            description: description.to_string(),
-        });
+    pub fn prompt_permission(&self, detail: super::events::PermissionDetail) -> bool {
+        self.send(UiEvent::PermissionPrompt(detail));
         // Block waiting for the permission response
         loop {
             match self.command_rx.recv() {
@@ -166,14 +152,14 @@ impl UiBridge {
 /// commands back to the main thread.
 #[derive(Clone)]
 pub struct UiHandle {
-    pub event_rx: Receiver<UiEvent>,
-    pub command_tx: Sender<UiCommand>,
+    pub event_rx: smol::channel::Receiver<UiEvent>,
+    pub command_tx: CbSender<UiCommand>,
     pub escape_flag: Arc<AtomicBool>,
 }
 
 impl Default for UiHandle {
     fn default() -> Self {
-        let (_, event_rx) = crossbeam_channel::unbounded();
+        let (_, event_rx) = smol::channel::unbounded();
         let (command_tx, _) = crossbeam_channel::unbounded();
         Self {
             event_rx,
@@ -184,6 +170,11 @@ impl Default for UiHandle {
 }
 
 impl UiHandle {
+    /// Receive an event asynchronously (wakes immediately when available).
+    pub async fn recv_event(&self) -> Option<UiEvent> {
+        self.event_rx.recv().await.ok()
+    }
+
     /// Try to receive an event (non-blocking).
     pub fn try_recv_event(&self) -> Option<UiEvent> {
         self.event_rx.try_recv().ok()

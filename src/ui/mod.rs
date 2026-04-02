@@ -2,12 +2,13 @@ pub mod bridge;
 pub mod components;
 pub mod events;
 pub mod input_queue;
+pub mod markdown;
 pub mod render;
 pub mod renderer;
 pub mod thinking;
 
 use crate::commands;
-use crate::config::Config;
+use crate::config::{CliOverrides, Config};
 use crate::engine;
 use crate::engine::cost::CostTracker;
 use crate::messages::types::Message;
@@ -64,8 +65,20 @@ async fn fetch_pricing(client: &crate::api::ApiClient, config: &mut Config) {
     }
 }
 
+/// Build the effective system prompt override from CLI overrides.
+fn build_system_prompt_override(overrides: &CliOverrides, cwd: &std::path::Path, model: &str) -> Option<String> {
+    if let Some(ref prompt) = overrides.system_prompt {
+        Some(prompt.clone())
+    } else if let Some(ref append) = overrides.append_system_prompt {
+        let base = engine::context::build_system_prompt(cwd, model);
+        Some(format!("{base}\n\n{append}"))
+    } else {
+        None
+    }
+}
+
 /// Run the interactive REPL with the iocraft-based UI.
-pub async fn run_repl(mut config: Config) -> Result<()> {
+pub async fn run_repl(mut config: Config, overrides: &CliOverrides, resume_session: Option<Session>) -> Result<()> {
     let client = Arc::new(crate::api::ApiClient::new(
         config.api_key.clone(),
         Some(config.base_url.clone()),
@@ -77,9 +90,24 @@ pub async fn run_repl(mut config: Config) -> Result<()> {
 
     let tool_registry = tools::build_default_registry();
     let tool_context = build_tool_context(&config, client.clone());
-    let mut messages: Vec<Message> = Vec::new();
-    let mut cost_tracker = CostTracker::with_pricing(config.pricing_table.clone());
-    let mut session = Session::new(config.cwd.clone(), config.model.clone());
+
+    // Restore session state if resuming, otherwise start fresh
+    let (mut messages, mut cost_tracker, mut session) = if let Some(s) = resume_session {
+        let mut ct = CostTracker::with_pricing(config.pricing_table.clone());
+        ct.total_input_tokens = s.total_input_tokens;
+        ct.total_output_tokens = s.total_output_tokens;
+        let msgs = s.messages.clone();
+        (msgs, ct, s)
+    } else {
+        (
+            Vec::new(),
+            CostTracker::with_pricing(config.pricing_table.clone()),
+            Session::new(config.cwd.clone(), config.model.clone()),
+        )
+    };
+
+    // Build system prompt override from CLI flags
+    let system_prompt_override = build_system_prompt_override(overrides, &config.cwd, &config.model);
 
     // Print welcome banner before the UI thread takes over
     print_welcome(&config);
@@ -97,11 +125,37 @@ pub async fn run_repl(mut config: Config) -> Result<()> {
     bridge.model_info(&routing);
     bridge.turn_info(0, config.max_turns);
 
+    // Show resumed session info
+    if !messages.is_empty() {
+        let cost = cost_tracker.estimate_cost_usd(&config.model);
+        bridge.cost_update(
+            cost_tracker.total_input_tokens,
+            cost_tracker.total_output_tokens,
+            cost,
+        );
+        bridge.status(
+            &format!(
+                "Resumed session {} — {} messages restored",
+                &session.id[..8.min(session.id.len())],
+                messages.len(),
+            ),
+            StatusLevel::Info,
+        );
+    }
+
     // Spawn the iocraft UI thread
     let ui_thread = renderer::spawn_ui_thread(ui_handle);
 
     // Give the UI thread a moment to initialize
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Fire SessionStart hook
+    crate::hooks::run_event_hooks(
+        &config.hooks,
+        "SessionStart",
+        serde_json::json!({ "session_id": session.id, "resumed": !messages.is_empty() }),
+        &config.cwd,
+    ).await;
 
     // Main REPL loop: send prompt events, wait for input, run queries
     loop {
@@ -143,6 +197,20 @@ pub async fn run_repl(mut config: Config) -> Result<()> {
             }
         }
 
+        // Echo user input to the content area
+        bridge.send(crate::ui::events::UiEvent::StatusMessage {
+            text: format!("\x1b[1;32m❯\x1b[0m \x1b[1m{input}\x1b[0m"),
+            level: StatusLevel::Info,
+        });
+
+        // Fire UserPromptSubmit hook
+        crate::hooks::run_event_hooks(
+            &config.hooks,
+            "UserPromptSubmit",
+            serde_json::json!({ "prompt": &input }),
+            &config.cwd,
+        ).await;
+
         // Run the query
         messages.push(Message::user_text(&input));
         escape_flag.store(false, Ordering::Relaxed);
@@ -155,8 +223,9 @@ pub async fn run_repl(mut config: Config) -> Result<()> {
             &mut cost_tracker,
             &tool_context,
             &escape_flag,
-            None,
+            system_prompt_override.as_deref(),
             Some(&bridge),
+            crate::output::OutputFormat::Text,
         )
         .await
         {
@@ -176,6 +245,18 @@ pub async fn run_repl(mut config: Config) -> Result<()> {
             cost,
         );
     }
+
+    // Fire SessionEnd hook
+    crate::hooks::run_event_hooks(
+        &config.hooks,
+        "SessionEnd",
+        serde_json::json!({
+            "session_id": session.id,
+            "total_cost_usd": cost_tracker.estimate_cost_usd(&config.model),
+            "total_turns": messages.len(),
+        }),
+        &config.cwd,
+    ).await;
 
     // Tell the UI to exit
     bridge.request_exit();
@@ -274,7 +355,7 @@ impl Drop for EscapeListenerGuard {
 }
 
 /// Run a one-shot query (non-interactive, no iocraft UI).
-pub async fn run_oneshot(mut config: Config, prompt: &str) -> Result<()> {
+pub async fn run_oneshot(mut config: Config, prompt: &str, overrides: &CliOverrides) -> Result<()> {
     let client = Arc::new(crate::api::ApiClient::new(
         config.api_key.clone(),
         Some(config.base_url.clone()),
@@ -288,6 +369,11 @@ pub async fn run_oneshot(mut config: Config, prompt: &str) -> Result<()> {
     let mut messages = vec![Message::user_text(prompt)];
     let mut cost_tracker = CostTracker::with_pricing(config.pricing_table.clone());
 
+    let system_prompt_override = build_system_prompt_override(overrides, &config.cwd, &config.model);
+    let format = overrides.output_format.as_deref()
+        .map(crate::output::OutputFormat::from_str_opt)
+        .unwrap_or(crate::output::OutputFormat::Text);
+
     let escape_flag = Arc::new(AtomicBool::new(false));
     let _guard = spawn_escape_listener(&escape_flag);
     engine::query_loop(
@@ -298,13 +384,49 @@ pub async fn run_oneshot(mut config: Config, prompt: &str) -> Result<()> {
         &mut cost_tracker,
         &tool_context,
         &escape_flag,
-        None,
+        system_prompt_override.as_deref(),
         None, // no bridge for oneshot mode
+        format,
     )
     .await?;
 
-    if config.verbose {
-        eprintln!("{}", cost_tracker.summary(&config.model).dimmed());
+    let cost = cost_tracker.estimate_cost_usd(&config.model);
+
+    match format {
+        crate::output::OutputFormat::Json => {
+            // Extract final assistant text from messages
+            let final_text = messages.iter().rev().find_map(|m| {
+                if let Message::Assistant(a) = m {
+                    let texts: Vec<&str> = a.content.iter().filter_map(|b| {
+                        if let crate::api::types::ContentBlock::Text { text } = b { Some(text.as_str()) } else { None }
+                    }).collect();
+                    if texts.is_empty() { None } else { Some(texts.join("\n")) }
+                } else { None }
+            }).unwrap_or_default();
+
+            let output = serde_json::json!({
+                "role": "assistant",
+                "content": final_text,
+                "cost": { "usd": cost },
+                "tokens": {
+                    "input": cost_tracker.total_input_tokens,
+                    "output": cost_tracker.total_output_tokens,
+                }
+            });
+            println!("{}", serde_json::to_string(&output).unwrap_or_default());
+        }
+        crate::output::OutputFormat::StreamJson => {
+            crate::output::StreamEvent::done(
+                cost,
+                cost_tracker.total_input_tokens,
+                cost_tracker.total_output_tokens,
+            ).emit();
+        }
+        crate::output::OutputFormat::Text => {
+            if config.verbose {
+                eprintln!("{}", cost_tracker.summary(&config.model).dimmed());
+            }
+        }
     }
 
     Ok(())

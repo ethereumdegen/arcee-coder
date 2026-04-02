@@ -7,7 +7,7 @@ use std::path::PathBuf;
 pub struct GrepTool;
 
 const DEFAULT_HEAD_LIMIT: usize = 250;
-const MAX_OUTPUT_CHARS: usize = 100_000;
+const MAX_OUTPUT_CHARS: usize = 20_000;
 
 #[async_trait]
 impl Tool for GrepTool {
@@ -16,9 +16,20 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> String {
-        "Searches file contents using regex patterns. Supports filtering by glob pattern \
-         or file type. Output modes: \"content\" shows matching lines, \"files_with_matches\" \
-         shows only file paths (default), \"count\" shows match counts."
+        "A powerful search tool built on ripgrep.\n\n\
+         REQUIRED parameter: \"pattern\" (string) — the regex pattern to search for.\n\
+         Example call: {\"pattern\": \"fn main\", \"glob\": \"*.rs\"}\n\n\
+         Usage:\n\
+         - ALWAYS use Grep for search tasks. NEVER invoke `grep` or `rg` as a Bash command.\n\
+         - Supports full regex syntax (e.g., \"log.*Error\", \"function\\s+\\w+\")\n\
+         - Filter files with glob parameter (e.g., \"*.js\", \"**/*.tsx\") or type parameter \
+         (e.g., \"js\", \"py\", \"rust\")\n\
+         - Output modes: \"content\" shows matching lines, \"files_with_matches\" shows only \
+         file paths (default), \"count\" shows match counts\n\
+         - Pattern syntax: Uses ripgrep (not grep) - literal braces need escaping \
+         (use `interface\\{\\}` to find `interface{}` in Go code)\n\
+         - Multiline matching: By default patterns match within single lines only. \
+         For cross-line patterns like `struct \\{[\\s\\S]*?field`, use `multiline: true`"
             .to_string()
     }
 
@@ -28,36 +39,60 @@ impl Tool for GrepTool {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Regex pattern to search for"
+                    "description": "The regular expression pattern to search for in file contents"
                 },
                 "path": {
                     "type": "string",
-                    "description": "File or directory to search in (defaults to cwd)"
+                    "description": "File or directory to search in (rg PATH). Defaults to current working directory."
                 },
                 "glob": {
                     "type": "string",
-                    "description": "Glob pattern to filter files (e.g., \"*.rs\")"
+                    "description": "Glob pattern to filter files (e.g. \"*.js\", \"*.{ts,tsx}\") - maps to rg --glob"
                 },
                 "output_mode": {
                     "type": "string",
                     "enum": ["content", "files_with_matches", "count"],
-                    "description": "Output mode (default: files_with_matches)"
+                    "description": "Output mode: \"content\" shows matching lines (supports -A/-B/-C context, -n line numbers, head_limit), \"files_with_matches\" shows file paths (supports head_limit), \"count\" shows match counts (supports head_limit). Defaults to \"files_with_matches\"."
+                },
+                "-B": {
+                    "type": "number",
+                    "description": "Number of lines to show before each match (rg -B). Requires output_mode: \"content\", ignored otherwise."
+                },
+                "-A": {
+                    "type": "number",
+                    "description": "Number of lines to show after each match (rg -A). Requires output_mode: \"content\", ignored otherwise."
+                },
+                "-C": {
+                    "type": "number",
+                    "description": "Alias for context."
                 },
                 "context": {
                     "type": "number",
-                    "description": "Lines of context around matches (for content mode)"
+                    "description": "Number of lines to show before and after each match (rg -C). Requires output_mode: \"content\", ignored otherwise."
                 },
-                "case_insensitive": {
+                "-n": {
                     "type": "boolean",
-                    "description": "Case insensitive search"
+                    "description": "Show line numbers in output (rg -n). Requires output_mode: \"content\", ignored otherwise. Defaults to true."
+                },
+                "-i": {
+                    "type": "boolean",
+                    "description": "Case insensitive search (rg -i)"
+                },
+                "type": {
+                    "type": "string",
+                    "description": "File type to search (rg --type). Common types: js, py, rust, go, java, etc. More efficient than include for standard file types."
                 },
                 "head_limit": {
                     "type": "number",
-                    "description": "Max results to return (default: 250, 0=unlimited)"
+                    "description": "Limit output to first N lines/entries, equivalent to \"| head -N\". Works across all output modes: content (limits output lines), files_with_matches (limits file paths), count (limits count entries). Defaults to 250 when unspecified. Pass 0 for unlimited."
+                },
+                "offset": {
+                    "type": "number",
+                    "description": "Skip first N lines/entries before applying head_limit, equivalent to \"| tail -n +N | head -N\". Works across all output modes. Defaults to 0."
                 },
                 "multiline": {
                     "type": "boolean",
-                    "description": "Enable multiline mode for cross-line patterns"
+                    "description": "Enable multiline mode where . matches newlines and patterns can span lines (rg -U --multiline-dotall). Default: false."
                 }
             },
             "required": ["pattern"]
@@ -77,11 +112,6 @@ impl Tool for GrepTool {
             return Ok(ToolResult::error("Pattern cannot be empty"));
         }
 
-        // Basic regex complexity check: reject obviously catastrophic patterns
-        if pattern.len() > 1000 {
-            return Ok(ToolResult::error("Pattern too long (max 1000 chars)"));
-        }
-
         let search_path = match input["path"].as_str() {
             Some(p) => {
                 let pb = PathBuf::from(p);
@@ -95,74 +125,75 @@ impl Tool for GrepTool {
         };
 
         let glob_filter = input["glob"].as_str().map(String::from);
+        let type_filter = input["type"].as_str().map(String::from);
         let output_mode = input["output_mode"]
             .as_str()
             .unwrap_or("files_with_matches");
-        let context_lines = input["context"].as_u64().unwrap_or(0) as usize;
-        let case_insensitive = input["case_insensitive"].as_bool().unwrap_or(false);
+
+        // Context lines: support -C, -B, -A aliases
+        let context_lines = input["context"].as_u64()
+            .or_else(|| input["-C"].as_u64())
+            .unwrap_or(0) as usize;
+        let before_context = input["-B"].as_u64().unwrap_or(0) as usize;
+        let after_context = input["-A"].as_u64().unwrap_or(0) as usize;
+
+        let case_insensitive = input["-i"].as_bool()
+            .or_else(|| input["case_insensitive"].as_bool())
+            .unwrap_or(false);
+        let show_line_numbers = input["-n"].as_bool().unwrap_or(true);
         let head_limit = input["head_limit"]
             .as_u64()
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_HEAD_LIMIT);
+        let offset = input["offset"].as_u64().unwrap_or(0) as usize;
         let multiline = input["multiline"].as_bool().unwrap_or(false);
 
-        // Try ripgrep first, fall back to system grep
-        let have_rg = tokio::process::Command::new("rg")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-            .is_ok();
+        let mut cmd = tokio::process::Command::new("rg");
+        cmd.arg("--no-heading");
+        cmd.arg("--max-columns").arg("500");
+        cmd.arg("--max-columns-preview");
 
-        let mut cmd;
-        if have_rg {
-            cmd = tokio::process::Command::new("rg");
-            cmd.arg("--no-heading");
-            cmd.arg("--max-columns").arg("500");
-            cmd.arg("--max-columns-preview");
-
-            match output_mode {
-                "files_with_matches" => { cmd.arg("--files-with-matches"); }
-                "count" => { cmd.arg("--count"); }
-                "content" | _ => {
+        match output_mode {
+            "files_with_matches" => {
+                cmd.arg("--files-with-matches");
+                cmd.arg("--sort=modified");
+            }
+            "count" => {
+                cmd.arg("--count");
+            }
+            "content" | _ => {
+                if show_line_numbers {
                     cmd.arg("--line-number");
-                    if context_lines > 0 {
-                        cmd.arg("-C").arg(context_lines.to_string());
+                }
+                if context_lines > 0 {
+                    cmd.arg("-C").arg(context_lines.to_string());
+                } else {
+                    if before_context > 0 {
+                        cmd.arg("-B").arg(before_context.to_string());
+                    }
+                    if after_context > 0 {
+                        cmd.arg("-A").arg(after_context.to_string());
                     }
                 }
             }
-
-            if case_insensitive { cmd.arg("-i"); }
-            if multiline { cmd.arg("-U").arg("--multiline-dotall"); }
-            if let Some(ref glob_pat) = glob_filter {
-                cmd.arg("--glob").arg(glob_pat);
-            }
-            if pattern.starts_with('-') { cmd.arg("-e"); }
-            cmd.arg(pattern).arg(&search_path);
-        } else {
-            // Fallback to system grep
-            cmd = tokio::process::Command::new("grep");
-            cmd.arg("-r"); // recursive
-
-            match output_mode {
-                "files_with_matches" => { cmd.arg("-l"); }
-                "count" => { cmd.arg("-c"); }
-                "content" | _ => {
-                    cmd.arg("-n"); // line numbers
-                    if context_lines > 0 {
-                        cmd.arg("-C").arg(context_lines.to_string());
-                    }
-                }
-            }
-
-            if case_insensitive { cmd.arg("-i"); }
-            if let Some(ref glob_pat) = glob_filter {
-                cmd.arg("--include").arg(glob_pat);
-            }
-            if pattern.starts_with('-') { cmd.arg("-e"); }
-            cmd.arg(pattern).arg(&search_path);
         }
+
+        if case_insensitive {
+            cmd.arg("-i");
+        }
+        if multiline {
+            cmd.arg("-U").arg("--multiline-dotall");
+        }
+        if let Some(ref glob_pat) = glob_filter {
+            cmd.arg("--glob").arg(glob_pat);
+        }
+        if let Some(ref type_name) = type_filter {
+            cmd.arg("--type").arg(type_name);
+        }
+        if pattern.starts_with('-') {
+            cmd.arg("-e");
+        }
+        cmd.arg(pattern).arg(&search_path);
 
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -177,7 +208,7 @@ impl Tool for GrepTool {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => {
                 return Ok(ToolResult::error(format!(
-                    "Search command failed: {e}. Neither ripgrep (rg) nor grep are available."
+                    "Search command failed: {e}. Is ripgrep (rg) installed?"
                 )));
             }
             Err(_) => {
@@ -214,19 +245,33 @@ impl Tool for GrepTool {
             )));
         }
 
-        // Apply head_limit
+        // Relativize paths to save tokens
+        let result = relativize_paths(&result, &context.cwd);
+
+        // Apply offset + head_limit
         let mut lines: Vec<&str> = result.lines().collect();
         let total = lines.len();
-        let was_limited = head_limit > 0 && total > head_limit;
+
+        // Apply offset first
+        if offset > 0 && offset < lines.len() {
+            lines = lines[offset..].to_vec();
+        } else if offset >= lines.len() {
+            return Ok(ToolResult::success(format!(
+                "No results at offset {offset} (total: {total})"
+            )));
+        }
+
+        let was_limited = head_limit > 0 && lines.len() > head_limit;
         if was_limited {
             lines.truncate(head_limit);
         }
         let mut output_str = lines.join("\n");
 
-        if was_limited {
+        if was_limited || offset > 0 {
+            let showing = lines.len();
             output_str.push_str(&format!(
-                "\n\n... ({} results shown of {} total)",
-                head_limit, total
+                "\n\n({showing} results shown, {total} total{})",
+                if offset > 0 { format!(", offset {offset}") } else { String::new() }
             ));
         }
 
@@ -243,4 +288,10 @@ impl Tool for GrepTool {
 
         Ok(ToolResult::success(output_str))
     }
+}
+
+/// Convert absolute paths to relative paths to save tokens.
+fn relativize_paths(text: &str, cwd: &std::path::Path) -> String {
+    let cwd_str = format!("{}/", cwd.display());
+    text.replace(&cwd_str, "")
 }

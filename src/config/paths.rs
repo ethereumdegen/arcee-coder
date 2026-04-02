@@ -12,6 +12,11 @@ pub fn sessions_dir() -> PathBuf {
     config_dir().join("sessions")
 }
 
+/// Returns the prompt history file path (~/.arcee/history).
+pub fn history_file() -> PathBuf {
+    config_dir().join("history")
+}
+
 /// Ensure all required directories exist.
 pub fn ensure_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(config_dir())?;

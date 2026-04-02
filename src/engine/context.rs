@@ -22,8 +22,37 @@ pub fn build_system_prompt(cwd: &Path, model: &str) -> String {
     prompt.push_str("\n\n# Environment\n");
     prompt.push_str(&env_context);
 
+    // Auto-memory instructions
+    let memory_dir = cwd.join(".arcee").join("memory");
+    prompt.push_str("\n\n# Auto Memory\n");
+    prompt.push_str(&format!(
+        "You have a persistent memory directory at `{}`. Its contents persist across sessions.\n\n\
+         As you work, consult your memory files to build on previous experience.\n\n\
+         ## How to save memories:\n\
+         - Organize memory semantically by topic, not chronologically\n\
+         - Use the Write and Edit tools to update your memory files\n\
+         - `MEMORY.md` is always loaded into your conversation context — lines after 200 will be truncated, so keep it concise\n\
+         - Create separate topic files (e.g., `debugging.md`, `patterns.md`) for detailed notes and link to them from MEMORY.md\n\
+         - Update or remove memories that turn out to be wrong or outdated\n\
+         - Do not write duplicate memories. First check if there is an existing memory you can update before writing a new one.\n\n\
+         ## What to save:\n\
+         - Stable patterns and conventions confirmed across multiple interactions\n\
+         - Key architectural decisions, important file paths, and project structure\n\
+         - User preferences for workflow, tools, and communication style\n\
+         - Solutions to recurring problems and debugging insights\n\n\
+         ## What NOT to save:\n\
+         - Session-specific context (current task details, in-progress work, temporary state)\n\
+         - Information that might be incomplete — verify against project docs before writing\n\
+         - Anything that duplicates or contradicts existing ARCEE.md instructions\n\
+         - Speculative or unverified conclusions from reading a single file\n\n\
+         ## Explicit user requests:\n\
+         - When the user asks you to remember something across sessions, save it immediately\n\
+         - When the user asks to forget or stop remembering something, find and remove the relevant entries from your memory files\n",
+        memory_dir.display()
+    ));
+
     if !memory.is_empty() {
-        prompt.push_str("\n\n# Project Memory\n");
+        prompt.push_str("\n# Project Memory\n");
         prompt.push_str(&memory);
     }
 
@@ -316,16 +345,17 @@ fn build_environment_context(cwd: &Path) -> String {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string());
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     let git_info = get_git_info(cwd);
 
     let mut ctx = format!(
-        "- Working directory: {}\n- Platform: {os}/{arch}\n- Shell: {shell}",
+        "- Working directory: {}\n- Platform: {os}/{arch}\n- Shell: {shell}\n- Date: {today}",
         cwd.display()
     );
 
     if let Some(info) = git_info {
-        ctx.push_str(&format!("\n- Git: {info}"));
+        ctx.push_str(&format!("\n- {info}"));
     }
 
     ctx
@@ -342,48 +372,128 @@ fn get_git_info(cwd: &Path) -> Option<String> {
         return None;
     }
 
-    let branch = std::process::Command::new("git")
-        .args(["branch", "--show-current"])
-        .current_dir(cwd)
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "detached".to_string());
+    let run_git = |args: &[&str]| -> Option<String> {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
 
-    Some(format!("branch={branch}"))
+    let branch = run_git(&["branch", "--show-current"]).unwrap_or_else(|| "detached".to_string());
+
+    // Detect main/default branch
+    let main_branch = run_git(&["rev-parse", "--verify", "refs/heads/main"])
+        .map(|_| "main".to_string())
+        .or_else(|| {
+            run_git(&["rev-parse", "--verify", "refs/heads/master"]).map(|_| "master".to_string())
+        })
+        .unwrap_or_else(|| branch.clone());
+
+    let mut info = format!("Is a git repository: true\n");
+    info.push_str(&format!("- Current branch: {branch}\n"));
+    info.push_str(&format!("- Main branch: {main_branch}\n"));
+
+    // Git status (short, capped)
+    if let Some(status) = run_git(&["status", "--short"]) {
+        let status_lines: Vec<&str> = status.lines().collect();
+        let display = if status_lines.len() > 30 {
+            let truncated: String = status_lines[..30].join("\n");
+            format!("{truncated}\n... ({} more files)", status_lines.len() - 30)
+        } else {
+            status.clone()
+        };
+        info.push_str(&format!("- Status:\n{display}\n"));
+    }
+
+    // Recent commits (last 5)
+    if let Some(log) = run_git(&["log", "--oneline", "-5", "--no-decorate"]) {
+        info.push_str(&format!("- Recent commits:\n{log}"));
+    }
+
+    Some(info)
 }
 
 fn load_memory_files(cwd: &Path) -> String {
     let mut memory = String::new();
+    let mut seen_paths = std::collections::HashSet::new();
 
-    // Check for ARCEE.md project memory file
-    let arcee_md = cwd.join("ARCEE.md");
-    if arcee_md.exists() {
-        if let Ok(content) = std::fs::read_to_string(&arcee_md) {
-            memory.push_str("## ARCEE.md\n");
-            memory.push_str(&content);
-            memory.push('\n');
+    // 1. Walk from cwd upward to find ARCEE.md files (hierarchical, like CLAUDE.md)
+    let mut dir = Some(cwd.to_path_buf());
+    let mut arcee_md_stack: Vec<(std::path::PathBuf, String)> = Vec::new();
+    while let Some(d) = dir {
+        let arcee_md = d.join("ARCEE.md");
+        if arcee_md.exists() && seen_paths.insert(arcee_md.clone()) {
+            if let Ok(content) = std::fs::read_to_string(&arcee_md) {
+                arcee_md_stack.push((arcee_md, content));
+            }
+        }
+        dir = d.parent().map(|p| p.to_path_buf());
+    }
+    // Also check home dir
+    if let Some(home) = dirs::home_dir() {
+        let home_arcee = home.join("ARCEE.md");
+        if home_arcee.exists() && seen_paths.insert(home_arcee.clone()) {
+            if let Ok(content) = std::fs::read_to_string(&home_arcee) {
+                arcee_md_stack.push((home_arcee, content));
+            }
         }
     }
 
-    // Check for .arcee/memory/
+    // Show outermost (global) first, innermost (project-specific) last
+    arcee_md_stack.reverse();
+    for (path, content) in &arcee_md_stack {
+        let label = if path.parent() == Some(cwd) {
+            "ARCEE.md (project)".to_string()
+        } else {
+            format!("ARCEE.md ({})", path.parent().unwrap_or(path).display())
+        };
+        memory.push_str(&format!("## {label}\n{content}\n"));
+    }
+
+    // 2. Load project .arcee/memory/ files
     let arcee_memory = cwd.join(".arcee").join("memory");
     if arcee_memory.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&arcee_memory) {
-            for entry in entries.flatten() {
-                if entry.path().extension().is_some_and(|ext| ext == "md") {
-                    if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                        memory.push_str(&format!(
-                            "\n## {}\n{}\n",
-                            entry.file_name().to_string_lossy(),
-                            content
-                        ));
+        load_memory_dir(&arcee_memory, "project", &mut memory);
+    }
+
+    // 3. Load home dir ~/.arcee/memory/ files (global memory)
+    if let Some(home) = dirs::home_dir() {
+        let home_memory = home.join(".arcee").join("memory");
+        if home_memory.is_dir() && home_memory != arcee_memory {
+            load_memory_dir(&home_memory, "global", &mut memory);
+        }
+    }
+
+    memory
+}
+
+fn load_memory_dir(dir: &Path, scope: &str, output: &mut String) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut files: Vec<_> = entries.flatten().collect();
+        files.sort_by_key(|e| e.file_name());
+        for entry in files {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "md") {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    let fname = entry.file_name().to_string_lossy().to_string();
+                    // MEMORY.md is always loaded fully; other files are referenced
+                    if fname == "MEMORY.md" {
+                        // Truncate at 200 lines to keep context manageable
+                        let truncated: String = content
+                            .lines()
+                            .take(200)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        output.push_str(&format!("\n## {fname} ({scope})\n{truncated}\n"));
+                    } else {
+                        output.push_str(&format!("\n## {fname} ({scope})\n{content}\n"));
                     }
                 }
             }
         }
     }
-
-    memory
 }

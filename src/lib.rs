@@ -4,6 +4,7 @@ pub mod config;
 pub mod engine;
 pub mod hooks;
 pub mod messages;
+pub mod output;
 pub mod permissions;
 pub mod session;
 pub mod tools;

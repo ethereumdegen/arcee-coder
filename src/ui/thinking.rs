@@ -20,7 +20,7 @@ pub struct ThinkingIndicator {
 ///
 /// Uses an 8-column × 4-row grid, rendered as 4 braille characters per frame.
 /// Each column has a staggered offset so drops fall at different times.
-fn gen_rain_frames() -> Vec<String> {
+pub fn gen_rain_frames() -> Vec<String> {
     const W: usize = 8;
     const H: usize = 4;
     const TOTAL_FRAMES: usize = 12;

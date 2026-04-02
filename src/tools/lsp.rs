@@ -42,7 +42,7 @@ impl LspManager {
             if server.is_alive() {
                 false
             } else {
-                eprintln!("[LSP] Server for .{extension} died, restarting...");
+                // Server died — will restart silently below
                 true
             }
         } else {

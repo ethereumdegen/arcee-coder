@@ -17,8 +17,18 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> String {
-        "Reads a file from the filesystem. Returns the file contents with line numbers. \
-         You can optionally specify an offset and limit for large files."
+        "Reads a file from the local filesystem.\n\n\
+         REQUIRED parameter: \"file_path\" (string) — absolute path to the file to read.\n\
+         Example call: {\"file_path\": \"/home/user/project/src/main.rs\"}\n\n\
+         Usage:\n\
+         - The file_path parameter must be an absolute path, not a relative path\n\
+         - By default, it reads up to 2000 lines starting from the beginning of the file\n\
+         - You can optionally specify a line offset and limit (especially handy for long files), \
+         but it's recommended to read the whole file by not providing these parameters\n\
+         - Results are returned using cat -n format, with line numbers starting at 1\n\
+         - Any lines longer than 2000 characters will be truncated\n\
+         - This tool can only read files, not directories. To read a directory, use an ls \
+         command via the Bash tool."
             .to_string()
     }
 
@@ -28,15 +38,15 @@ impl Tool for ReadTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute path to the file to read"
+                    "description": "The absolute path to the file to read"
                 },
                 "offset": {
                     "type": "number",
-                    "description": "Line number to start reading from (1-based)"
+                    "description": "The line number to start reading from. Only provide if the file is too large to read at once"
                 },
                 "limit": {
                     "type": "number",
-                    "description": "Maximum number of lines to read (default: 2000)"
+                    "description": "The number of lines to read. Only provide if the file is too large to read at once."
                 }
             },
             "required": ["file_path"]
@@ -122,7 +132,8 @@ impl Tool for ReadTool {
             } else {
                 line.to_string()
             };
-            output.push_str(&format!("{:>6}\t{}\n", line_num, truncated));
+            // Use arrow separator like claude-code's cat -n format
+            output.push_str(&format!("{line_num:>5}→{truncated}\n"));
         }
 
         if end < total_lines {
@@ -134,7 +145,7 @@ impl Tool for ReadTool {
         }
 
         if output.is_empty() {
-            output = "(empty file)".to_string();
+            output = "<system-reminder>WARNING: This file exists but has empty contents.</system-reminder>".to_string();
         }
 
         Ok(ToolResult::success(output))

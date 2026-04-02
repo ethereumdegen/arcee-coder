@@ -105,6 +105,7 @@ const LIGHT_TOOLS: &[&str] = &[
 /// Tools that need reasoning — always use heavy.
 const HEAVY_TOOLS: &[&str] = &[
     "Edit", "Write", "Bash", "Agent", "NotebookEdit",
+    "TaskCreate", "TaskUpdate",
 ];
 
 /// Classify the upcoming turn based on heuristics + intensity preference.

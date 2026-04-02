@@ -11,6 +11,33 @@ pub struct HooksConfig {
 
     #[serde(rename = "PostToolUse", default)]
     pub post_tool_use: Vec<HookGroup>,
+
+    #[serde(rename = "Notification", default)]
+    pub notification: Vec<HookGroup>,
+
+    #[serde(rename = "UserPromptSubmit", default)]
+    pub user_prompt_submit: Vec<HookGroup>,
+
+    #[serde(rename = "SessionStart", default)]
+    pub session_start: Vec<HookGroup>,
+
+    #[serde(rename = "SessionEnd", default)]
+    pub session_end: Vec<HookGroup>,
+
+    #[serde(rename = "Stop", default)]
+    pub stop: Vec<HookGroup>,
+
+    #[serde(rename = "SubagentStart", default)]
+    pub subagent_start: Vec<HookGroup>,
+
+    #[serde(rename = "SubagentStop", default)]
+    pub subagent_stop: Vec<HookGroup>,
+
+    #[serde(rename = "PreCompact", default)]
+    pub pre_compact: Vec<HookGroup>,
+
+    #[serde(rename = "PostCompact", default)]
+    pub post_compact: Vec<HookGroup>,
 }
 
 /// A group of hooks that share a matcher pattern.
@@ -303,8 +330,92 @@ pub async fn run_post_tool_hooks(
     context_parts.join("\n")
 }
 
+/// Get the hook groups for a given event name.
+fn get_event_hooks<'a>(config: &'a HooksConfig, event: &str) -> &'a [HookGroup] {
+    match event {
+        "PreToolUse" => &config.pre_tool_use,
+        "PostToolUse" => &config.post_tool_use,
+        "Notification" => &config.notification,
+        "UserPromptSubmit" => &config.user_prompt_submit,
+        "SessionStart" => &config.session_start,
+        "SessionEnd" => &config.session_end,
+        "Stop" => &config.stop,
+        "SubagentStart" => &config.subagent_start,
+        "SubagentStop" => &config.subagent_stop,
+        "PreCompact" => &config.pre_compact,
+        "PostCompact" => &config.post_compact,
+        _ => &[],
+    }
+}
+
+/// Run hooks for a generic event (non-tool events like SessionStart, Stop, etc.).
+/// The `data` payload is passed as `tool_input` in the HookInput for compatibility.
+/// Returns any additional context collected from hooks.
+pub async fn run_event_hooks(
+    config: &HooksConfig,
+    event_name: &str,
+    data: serde_json::Value,
+    cwd: &Path,
+) -> String {
+    let groups = get_event_hooks(config, event_name);
+    if groups.is_empty() {
+        return String::new();
+    }
+
+    let input = HookInput {
+        hook_event_name: event_name.to_string(),
+        tool_name: String::new(),
+        tool_input: data,
+        tool_response: None,
+        cwd: cwd.display().to_string(),
+    };
+    let input_json = serde_json::to_string(&input).unwrap_or_default();
+
+    let mut context_parts = Vec::new();
+
+    for group in groups {
+        // For non-tool events, matcher is ignored (or matches on event-specific fields)
+        for action in &group.hooks {
+            if action.action_type != "command" {
+                continue;
+            }
+            let timeout = action.timeout.unwrap_or(120);
+            let result = run_hook_command(&action.command, &input_json, timeout, cwd).await;
+
+            if result.timed_out {
+                context_parts.push(format!("[hook timeout: {}]", action.command));
+                continue;
+            }
+
+            let stdout = result.stdout.trim();
+            if !stdout.is_empty() {
+                if let Ok(output) = serde_json::from_str::<HookOutput>(stdout) {
+                    if let Some(ctx) = output.additional_context {
+                        if !ctx.is_empty() {
+                            context_parts.push(ctx);
+                        }
+                    }
+                } else {
+                    context_parts.push(stdout.to_string());
+                }
+            }
+        }
+    }
+
+    context_parts.join("\n")
+}
+
 /// Merge project-level hooks into existing config (additive).
 pub fn merge(base: &mut HooksConfig, overlay: HooksConfig) {
     base.pre_tool_use.extend(overlay.pre_tool_use);
     base.post_tool_use.extend(overlay.post_tool_use);
+    base.notification.extend(overlay.notification);
+    base.user_prompt_submit.extend(overlay.user_prompt_submit);
+    base.session_start.extend(overlay.session_start);
+    base.session_end.extend(overlay.session_end);
+    base.stop.extend(overlay.stop);
+    base.subagent_start.extend(overlay.subagent_start);
+    base.subagent_stop.extend(overlay.subagent_stop);
+    base.pre_compact.extend(overlay.pre_compact);
+    base.post_compact.extend(overlay.post_compact);
 }
