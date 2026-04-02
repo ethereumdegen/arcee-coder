@@ -308,7 +308,23 @@ pub fn prompt_user_permission(
     io::stdout().flush()?;
 
     let mut response = String::new();
-    io::stdin().read_line(&mut response)?;
+    match io::stdin().read_line(&mut response) {
+        Ok(0) => {
+            eprintln!(
+                "{}",
+                "[permission prompt: stdin returned EOF, denying]".yellow()
+            );
+            return Ok(false);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!(
+                "{}",
+                format!("[permission prompt: stdin read error: {e}, denying]").yellow()
+            );
+            return Ok(false);
+        }
+    }
 
     Ok(response.trim().eq_ignore_ascii_case("y"))
 }

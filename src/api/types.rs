@@ -109,6 +109,9 @@ pub struct FunctionDefinition {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+    /// When true, the API should enforce strict schema adherence for tool calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 impl ToolDefinition {
@@ -119,6 +122,7 @@ impl ToolDefinition {
                 name: name.into(),
                 description: description.into(),
                 parameters,
+                strict: Some(true),
             },
         }
     }
@@ -243,7 +247,13 @@ impl StopReason {
             "tool_calls" => Self::ToolUse,
             "length" => Self::MaxTokens,
             "stop_sequence" => Self::StopSequence,
-            _ => Self::EndTurn,
+            other => {
+                eprintln!(
+                    "\x1b[33m[warning: unknown finish_reason '{}', treating as end_turn]\x1b[0m",
+                    other
+                );
+                Self::EndTurn
+            }
         }
     }
 }

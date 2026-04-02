@@ -54,43 +54,19 @@ fn classify_task(
         return TaskWeight::Heavy;
     }
 
-    // If last turn used complex tools, stay heavy
-    let heavy_tools = [
-        "Write", "Edit", "Bash", "Agent",
-    ];
-    if last_tool_names
-        .iter()
-        .any(|t| heavy_tools.contains(&t.as_str()))
-    {
+    // During an active agentic loop (model made tool calls last turn and we're
+    // continuing), ALWAYS use the heavy model. Mini is too weak for multi-step
+    // tool use — it generates malformed arguments and asks unnecessary questions.
+    if !last_tool_names.is_empty() {
         return TaskWeight::Heavy;
     }
 
-    // If last turn was only read-only tools, might be light
-    let light_tools = ["Read", "Glob", "Grep", "WebFetch", "AskUserQuestion"];
-    let all_light = !last_tool_names.is_empty()
-        && last_tool_names
-            .iter()
-            .all(|t| light_tools.contains(&t.as_str()));
-
-    if all_light {
-        // Check if the latest user message is short/simple
-        if let Some(last_user_len) = last_user_message_len(messages) {
-            if last_user_len < 200 {
-                return TaskWeight::Light;
-            }
+    // After a text-only turn (no tools), user replied with something new.
+    // Use mini only for trivially short follow-ups.
+    if let Some(last_user_len) = last_user_message_len(messages) {
+        if last_user_len < 80 && turn_count <= 3 {
+            return TaskWeight::Light;
         }
-    }
-
-    // If the conversation is getting long, use the thinking model for coherence
-    if turn_count > 10 {
-        return TaskWeight::Heavy;
-    }
-
-    // After a tool-only turn (continuing agentic loop), check what's happening
-    if last_tool_names.is_empty() {
-        // No tools last turn = assistant gave a text response, user replied
-        // Probably needs reasoning
-        return TaskWeight::Heavy;
     }
 
     // Default: heavy (better to be safe)

@@ -23,6 +23,8 @@ const AUTO_COMPACT_TOKEN_THRESHOLD: u64 = 80_000;
 const AUTO_COMPACT_KEEP_RECENT: usize = 10;
 /// Max consecutive max_tokens recovery attempts.
 const MAX_OUTPUT_RECOVERY_ATTEMPTS: u32 = 3;
+/// Max retries for transient API errors (rate-limit, server errors, network).
+const MAX_API_RETRIES: u32 = 3;
 
 /// Run the main query loop: send messages to the API, execute tool calls, repeat.
 pub async fn query_loop(
@@ -31,13 +33,10 @@ pub async fn query_loop(
     tools: &ToolRegistry,
     config: &Config,
     cost_tracker: &mut CostTracker,
+    tool_context: &ToolContext,
 ) -> Result<()> {
     let system_prompt = context::build_system_prompt(&config.cwd, &config.model);
     let tool_defs = tools.definitions();
-    let tool_context = ToolContext {
-        cwd: config.cwd.clone(),
-        permission_mode: config.permission_mode,
-    };
 
     let mut turns = 0;
     let mut max_tokens_recoveries: u32 = 0;
@@ -76,65 +75,91 @@ pub async fn query_loop(
             eprintln!("{}", format!("[model: {model}]").dimmed());
         }
 
-        // Build API messages
-        let api_messages = normalize_for_api(messages);
+        // Retry loop for transient API errors
+        let mut api_retries = 0u32;
+        let (content_blocks, stop_reason, usage) = loop {
+            // Build API messages (rebuilt each retry in case compaction changed them)
+            let api_messages = normalize_for_api(messages);
 
-        // Stream the response with thinking indicator
-        let thinking = std::sync::Mutex::new(Some(ThinkingIndicator::start()));
+            // Stream the response with thinking indicator
+            let thinking = std::sync::Mutex::new(Some(ThinkingIndicator::start()));
 
-        let mut on_text = |text: &str| {
-            // Stop the thinking indicator on first text output
+            let mut on_text = |text: &str| {
+                if let Ok(mut guard) = thinking.lock() {
+                    if let Some(indicator) = guard.take() {
+                        indicator.stop();
+                    }
+                }
+                print!("{text}");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            };
+
+            let mut on_tool_start = |_id: &str, name: &str| {
+                if let Ok(mut guard) = thinking.lock() {
+                    if let Some(indicator) = guard.take() {
+                        indicator.stop();
+                    }
+                }
+                println!("\n{} {}", "Tool:".cyan().bold(), name.cyan());
+            };
+
+            let result = client
+                .send_message_with_model(
+                    &model,
+                    &system_prompt,
+                    api_messages,
+                    tool_defs.clone(),
+                    config.max_tokens,
+                    &mut on_text,
+                    &mut on_tool_start,
+                )
+                .await;
+
+            // Ensure thinking indicator is stopped after streaming completes
             if let Ok(mut guard) = thinking.lock() {
                 if let Some(indicator) = guard.take() {
                     indicator.stop();
                 }
             }
-            print!("{text}");
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-        };
 
-        let mut on_tool_start = |_id: &str, name: &str| {
-            // Stop thinking indicator if a tool starts before any text
-            if let Ok(mut guard) = thinking.lock() {
-                if let Some(indicator) = guard.take() {
-                    indicator.stop();
+            match result {
+                Ok(r) => break r,
+                Err(crate::api::errors::ApiError::ContextTooLong(_)) => {
+                    eprintln!(
+                        "{}",
+                        "[context too long, compacting...]".yellow()
+                    );
+                    *messages = compact::compact_messages(messages, 6);
+                    continue; // retry immediately after compaction
+                }
+                Err(e) if e.is_retryable() && api_retries < MAX_API_RETRIES => {
+                    api_retries += 1;
+                    let delay = match &e {
+                        crate::api::errors::ApiError::RateLimit {
+                            retry_after_secs: Some(s),
+                        } => *s,
+                        _ => 2u64.pow(api_retries), // exponential backoff
+                    };
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "[transient API error: {e} — retrying in {delay}s ({api_retries}/{MAX_API_RETRIES})]"
+                        )
+                        .yellow()
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        format!("[query_loop exiting: API error after {api_retries} retries: {e}]")
+                            .red()
+                    );
+                    return Err(anyhow::anyhow!("API error: {e}"));
                 }
             }
-            println!("\n{} {}", "Tool:".cyan().bold(), name.cyan());
-        };
-
-        let result = client
-            .send_message_with_model(
-                &model,
-                &system_prompt,
-                api_messages,
-                tool_defs.clone(),
-                config.max_tokens,
-                &mut on_text,
-                &mut on_tool_start,
-            )
-            .await;
-
-        // Ensure thinking indicator is stopped after streaming completes
-        if let Ok(mut guard) = thinking.lock() {
-            if let Some(indicator) = guard.take() {
-                indicator.stop();
-            }
-        }
-
-        let (content_blocks, stop_reason, usage) = match result {
-            Ok(r) => r,
-            Err(crate::api::errors::ApiError::ContextTooLong(_)) => {
-                // Try compacting and retrying
-                eprintln!(
-                    "{}",
-                    "[context too long, compacting...]".yellow()
-                );
-                *messages = compact::compact_messages(messages, 6);
-                continue;
-            }
-            Err(e) => return Err(anyhow::anyhow!("API error: {e}")),
         };
 
         cost_tracker.add_usage(&usage);
@@ -147,9 +172,29 @@ pub async fn query_loop(
         };
         messages.push(Message::Assistant(assistant_msg));
 
+        // Check if the response has any actual content
+        let has_text = content_blocks.iter().any(|b| matches!(b, ContentBlock::Text { text } if !text.trim().is_empty()));
+        let has_tool_calls = content_blocks.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+
         // Check if we're done
         if stop_reason == StopReason::EndTurn {
+            if !has_text && !has_tool_calls && turns > 0 {
+                // Empty response mid-conversation — likely a stream issue, not a real end
+                eprintln!(
+                    "{}",
+                    "[warning: model returned empty end_turn, injecting continuation]".yellow()
+                );
+                messages.push(Message::user_text(
+                    "It seems your response was cut off or empty. Please continue with the task.",
+                ));
+                turns += 1;
+                continue;
+            }
             println!();
+            eprintln!(
+                "{}",
+                format!("[loop exit: model returned end_turn at turn {turns}]").dimmed()
+            );
             break;
         }
 
@@ -173,6 +218,13 @@ pub async fn query_loop(
                 turns += 1;
                 continue;
             } else {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "[loop exit: max_tokens hit {MAX_OUTPUT_RECOVERY_ATTEMPTS} times, unrecoverable at turn {turns}]"
+                    )
+                    .red()
+                );
                 println!("\n{}", "(max tokens reached, could not recover)".yellow());
                 break;
             }
@@ -204,14 +256,28 @@ pub async fn query_loop(
                     }
                 };
 
+                // Validate required parameters before executing
+                if let Some(validation_error) = validate_tool_input(tool, input) {
+                    eprintln!(
+                        "{}",
+                        format!("[tool '{name}' input validation failed: {validation_error}]")
+                            .yellow()
+                    );
+                    results.push((id.clone(), validation_error, true));
+                    continue;
+                }
+
                 let is_read_only = tool.is_read_only(input);
+
+                // Read permission mode from shared state
+                let current_mode = *tool_context.permission_mode.lock().await;
 
                 // Check permissions
                 let perm = permissions::check_tool_permission(
                     name,
                     input,
                     is_read_only,
-                    config.permission_mode,
+                    current_mode,
                     &config.allow_rules,
                     &config.deny_rules,
                     config.permission_strictness,
@@ -253,7 +319,7 @@ pub async fn query_loop(
                         println!("{}", input_str.dimmed());
                     }
 
-                    match tool.call(input.clone(), &tool_context).await {
+                    match tool.call(input.clone(), tool_context).await {
                         Ok(mut result) => {
                             // Truncate large tool results
                             if result.content.len() > MAX_TOOL_RESULT_CHARS {
@@ -305,6 +371,10 @@ pub async fn query_loop(
 
         turns += 1;
         if turns >= config.max_turns {
+            eprintln!(
+                "{}",
+                format!("[loop exit: max turns limit ({}) reached]", config.max_turns).red()
+            );
             println!(
                 "\n{}",
                 format!("Max turns ({}) reached.", config.max_turns).yellow()
@@ -316,6 +386,11 @@ pub async fn query_loop(
         if let Some(budget) = config.budget_usd {
             let current_cost = cost_tracker.estimate_cost_usd(&config.model);
             if current_cost >= budget {
+                eprintln!(
+                    "{}",
+                    format!("[loop exit: budget ${budget:.2} exhausted (spent ${current_cost:.2})]")
+                        .red()
+                );
                 println!(
                     "\n{}",
                     format!("Budget limit (${budget:.2}) reached.").yellow()
@@ -326,4 +401,81 @@ pub async fn query_loop(
     }
 
     Ok(())
+}
+
+/// Validate tool input against the tool's JSON schema.
+/// Returns Some(error_message) if validation fails, None if OK.
+fn validate_tool_input(tool: &dyn crate::tools::Tool, input: &serde_json::Value) -> Option<String> {
+    let schema = tool.input_schema();
+
+    // Check required fields
+    if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
+        let mut missing: Vec<&str> = Vec::new();
+        for field in required {
+            if let Some(field_name) = field.as_str() {
+                let is_missing = match input.get(field_name) {
+                    None => true,
+                    Some(serde_json::Value::Null) => true,
+                    _ => false,
+                };
+                if is_missing {
+                    missing.push(field_name);
+                }
+            }
+        }
+        if !missing.is_empty() {
+            let schema_hint = schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .map(|props| {
+                    missing
+                        .iter()
+                        .filter_map(|name| {
+                            props.get(*name).and_then(|p| {
+                                let typ = p.get("type").and_then(|t| t.as_str()).unwrap_or("any");
+                                let desc = p.get("description").and_then(|d| d.as_str()).unwrap_or("");
+                                Some(format!("  - {name} ({typ}): {desc}"))
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+
+            return Some(format!(
+                "Missing required parameter(s): {}. You MUST provide these parameters.\n{}",
+                missing.join(", "),
+                schema_hint
+            ));
+        }
+    }
+
+    // Check type constraints for provided fields
+    if let (Some(properties), Some(input_obj)) = (
+        schema.get("properties").and_then(|p| p.as_object()),
+        input.as_object(),
+    ) {
+        for (key, value) in input_obj {
+            if let Some(prop_schema) = properties.get(key) {
+                if let Some(expected_type) = prop_schema.get("type").and_then(|t| t.as_str()) {
+                    let type_ok = match expected_type {
+                        "string" => value.is_string(),
+                        "number" | "integer" => value.is_number(),
+                        "boolean" => value.is_boolean(),
+                        "array" => value.is_array(),
+                        "object" => value.is_object(),
+                        _ => true,
+                    };
+                    if !type_ok {
+                        return Some(format!(
+                            "Parameter '{key}' must be type '{expected_type}', got: {}",
+                            value
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }

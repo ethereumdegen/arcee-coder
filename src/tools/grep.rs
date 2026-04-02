@@ -106,44 +106,63 @@ impl Tool for GrepTool {
             .unwrap_or(DEFAULT_HEAD_LIMIT);
         let multiline = input["multiline"].as_bool().unwrap_or(false);
 
-        // Build rg command
-        let mut cmd = tokio::process::Command::new("rg");
-        cmd.arg("--no-heading");
-        cmd.arg("--max-columns").arg("500"); // Prevent minified-file bloat
-        cmd.arg("--max-columns-preview"); // Show truncation marker
+        // Try ripgrep first, fall back to system grep
+        let have_rg = tokio::process::Command::new("rg")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .is_ok();
 
-        match output_mode {
-            "files_with_matches" => {
-                cmd.arg("--files-with-matches");
-            }
-            "count" => {
-                cmd.arg("--count");
-            }
-            "content" | _ => {
-                cmd.arg("--line-number");
-                if context_lines > 0 {
-                    cmd.arg("-C").arg(context_lines.to_string());
+        let mut cmd;
+        if have_rg {
+            cmd = tokio::process::Command::new("rg");
+            cmd.arg("--no-heading");
+            cmd.arg("--max-columns").arg("500");
+            cmd.arg("--max-columns-preview");
+
+            match output_mode {
+                "files_with_matches" => { cmd.arg("--files-with-matches"); }
+                "count" => { cmd.arg("--count"); }
+                "content" | _ => {
+                    cmd.arg("--line-number");
+                    if context_lines > 0 {
+                        cmd.arg("-C").arg(context_lines.to_string());
+                    }
                 }
             }
-        }
 
-        if case_insensitive {
-            cmd.arg("-i");
-        }
+            if case_insensitive { cmd.arg("-i"); }
+            if multiline { cmd.arg("-U").arg("--multiline-dotall"); }
+            if let Some(ref glob_pat) = glob_filter {
+                cmd.arg("--glob").arg(glob_pat);
+            }
+            if pattern.starts_with('-') { cmd.arg("-e"); }
+            cmd.arg(pattern).arg(&search_path);
+        } else {
+            // Fallback to system grep
+            cmd = tokio::process::Command::new("grep");
+            cmd.arg("-r"); // recursive
 
-        if multiline {
-            cmd.arg("-U").arg("--multiline-dotall");
-        }
+            match output_mode {
+                "files_with_matches" => { cmd.arg("-l"); }
+                "count" => { cmd.arg("-c"); }
+                "content" | _ => {
+                    cmd.arg("-n"); // line numbers
+                    if context_lines > 0 {
+                        cmd.arg("-C").arg(context_lines.to_string());
+                    }
+                }
+            }
 
-        if let Some(ref glob_pat) = glob_filter {
-            cmd.arg("--glob").arg(glob_pat);
+            if case_insensitive { cmd.arg("-i"); }
+            if let Some(ref glob_pat) = glob_filter {
+                cmd.arg("--include").arg(glob_pat);
+            }
+            if pattern.starts_with('-') { cmd.arg("-e"); }
+            cmd.arg(pattern).arg(&search_path);
         }
-
-        // Prevent patterns starting with '-' being treated as flags
-        if pattern.starts_with('-') {
-            cmd.arg("-e");
-        }
-        cmd.arg(pattern).arg(&search_path);
 
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -158,7 +177,7 @@ impl Tool for GrepTool {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => {
                 return Ok(ToolResult::error(format!(
-                    "ripgrep (rg) not found or failed: {e}. Install ripgrep for search support."
+                    "Search command failed: {e}. Neither ripgrep (rg) nor grep are available."
                 )));
             }
             Err(_) => {

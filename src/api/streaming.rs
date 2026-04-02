@@ -272,9 +272,28 @@ impl StreamAccumulator {
 
         // Add tool calls
         for tc in self.tool_calls {
-            let input = serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Object(
-                serde_json::Map::new(),
-            ));
+            let input = if tc.arguments.trim().is_empty() {
+                eprintln!(
+                    "\x1b[33m[warning: tool '{}' called with empty arguments]\x1b[0m",
+                    tc.name
+                );
+                serde_json::Value::Object(serde_json::Map::new())
+            } else {
+                match serde_json::from_str(&tc.arguments) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!(
+                            "\x1b[33m[warning: tool '{}' arguments failed to parse: {e}]\x1b[0m",
+                            tc.name
+                        );
+                        eprintln!(
+                            "\x1b[33m  raw arguments: {}\x1b[0m",
+                            &tc.arguments[..tc.arguments.len().min(200)]
+                        );
+                        serde_json::Value::Object(serde_json::Map::new())
+                    }
+                }
+            };
             blocks.push(ContentBlock::ToolUse {
                 id: tc.id,
                 name: tc.name,

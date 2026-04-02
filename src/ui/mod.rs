@@ -9,21 +9,40 @@ use crate::engine::cost::CostTracker;
 use crate::messages::types::Message;
 use crate::session::Session;
 use crate::tools;
+use crate::tools::lsp::LspManager;
+use crate::tools::task_store::TaskStore;
+use crate::tools::ToolContext;
 use crate::ui::input_queue::drain_pending_stdin;
 use anyhow::Result;
 use colored::Colorize;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+/// Build a ToolContext from the current config and shared state.
+fn build_tool_context(config: &Config, api_client: Arc<crate::api::ApiClient>) -> ToolContext {
+    ToolContext {
+        cwd: config.cwd.clone(),
+        permission_mode: Arc::new(Mutex::new(config.permission_mode)),
+        task_store: Arc::new(Mutex::new(TaskStore::new())),
+        api_client,
+        config: config.clone(),
+        lsp_manager: Arc::new(Mutex::new(LspManager::new())),
+        plan_file_path: Arc::new(Mutex::new(None)),
+    }
+}
 
 /// Run the interactive REPL.
 pub async fn run_repl(mut config: Config) -> Result<()> {
-    let client = crate::api::ApiClient::new(
+    let client = Arc::new(crate::api::ApiClient::new(
         config.api_key.clone(),
         Some(config.base_url.clone()),
         Some(config.model.clone()),
-    );
+    ));
 
     let tool_registry = tools::build_default_registry();
+    let tool_context = build_tool_context(&config, client.clone());
     let mut messages: Vec<Message> = Vec::new();
     let mut cost_tracker = CostTracker::new();
     let mut session = Session::new(config.cwd.clone(), config.model.clone());
@@ -61,6 +80,7 @@ pub async fn run_repl(mut config: Config) -> Result<()> {
                     &mut config,
                     &mut cost_tracker,
                     &mut session,
+                    &tool_context,
                 )
                 .await;
             }
@@ -68,11 +88,18 @@ pub async fn run_repl(mut config: Config) -> Result<()> {
                 println!("{}", "Interrupted.".yellow());
             }
             Err(ReadlineError::Eof) => {
+                eprintln!(
+                    "{}",
+                    "[REPL exit: EOF on stdin (Ctrl+D or stdin closed by child process)]".yellow()
+                );
                 println!("{}", "Goodbye!".dimmed());
                 break;
             }
             Err(e) => {
-                eprintln!("{}", format!("Input error: {e}").red());
+                eprintln!(
+                    "{}",
+                    format!("[REPL exit: readline error: {e}]").red()
+                );
                 break;
             }
         }
@@ -88,17 +115,18 @@ pub async fn run_repl(mut config: Config) -> Result<()> {
 /// the user typed ahead while the loop was running.
 async fn run_and_drain_queue(
     input: &str,
-    client: &crate::api::ApiClient,
+    client: &Arc<crate::api::ApiClient>,
     messages: &mut Vec<Message>,
     tools: &crate::tools::ToolRegistry,
     config: &mut Config,
     cost_tracker: &mut CostTracker,
     session: &mut Session,
+    tool_context: &ToolContext,
 ) {
     messages.push(Message::user_text(input));
 
     println!();
-    if let Err(e) = engine::query_loop(client, messages, tools, config, cost_tracker).await {
+    if let Err(e) = engine::query_loop(client, messages, tools, config, cost_tracker, tool_context).await {
         eprintln!("{}", format!("Error: {e}").red());
     }
 
@@ -122,7 +150,7 @@ async fn run_and_drain_queue(
         messages.push(Message::user_text(&queued_input));
 
         println!();
-        if let Err(e) = engine::query_loop(client, messages, tools, config, cost_tracker).await {
+        if let Err(e) = engine::query_loop(client, messages, tools, config, cost_tracker, tool_context).await {
             eprintln!("{}", format!("Error: {e}").red());
         }
 
@@ -166,13 +194,14 @@ fn print_cost(cost_tracker: &CostTracker, config: &Config) {
 
 /// Run a one-shot query (non-interactive).
 pub async fn run_oneshot(config: Config, prompt: &str) -> Result<()> {
-    let client = crate::api::ApiClient::new(
+    let client = Arc::new(crate::api::ApiClient::new(
         config.api_key.clone(),
         Some(config.base_url.clone()),
         Some(config.model.clone()),
-    );
+    ));
 
     let tool_registry = tools::build_default_registry();
+    let tool_context = build_tool_context(&config, client.clone());
     let mut messages = vec![Message::user_text(prompt)];
     let mut cost_tracker = CostTracker::new();
 
@@ -182,6 +211,7 @@ pub async fn run_oneshot(config: Config, prompt: &str) -> Result<()> {
         &tool_registry,
         &config,
         &mut cost_tracker,
+        &tool_context,
     )
     .await?;
 

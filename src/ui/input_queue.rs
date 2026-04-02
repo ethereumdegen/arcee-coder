@@ -1,3 +1,4 @@
+use colored::Colorize;
 use std::io::BufRead;
 use std::os::unix::io::AsRawFd;
 
@@ -26,7 +27,11 @@ pub fn drain_pending_stdin() -> Vec<String> {
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
-            Ok(0) => break,    // EOF
+            // In non-blocking mode on a terminal, Ok(0) means "no data
+            // available right now" — NOT a real EOF.  Treating it as EOF
+            // would leave stdin in a consumed state and cause rustyline to
+            // see EOF on the next readline(), killing the REPL.
+            Ok(0) => break,
             Ok(_) => {
                 let trimmed = line.trim().to_string();
                 if !trimmed.is_empty() {
@@ -34,11 +39,17 @@ pub fn drain_pending_stdin() -> Vec<String> {
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(_) => break,
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    format!("[drain_pending_stdin] read error: {e}").dimmed()
+                );
+                break;
+            }
         }
     }
 
-    // Restore blocking mode
+    // Restore blocking mode — always, even after errors
     unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
 
     lines

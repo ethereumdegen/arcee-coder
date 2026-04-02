@@ -1,19 +1,37 @@
+pub mod agent;
 pub mod ask_user;
 pub mod bash;
 pub mod edit;
 pub mod glob;
 pub mod grep;
+pub mod lsp;
+pub mod notebook_edit;
 pub mod path_safety;
+pub mod plan_mode;
 pub mod read;
+pub mod skill;
+pub mod task_create;
+pub mod task_get;
+pub mod task_list;
+pub mod task_store;
+pub mod task_update;
 pub mod web_fetch;
+pub mod web_search;
+pub mod worktree;
 pub mod write;
 
+use crate::api::client::ApiClient;
 use crate::api::types::ToolDefinition;
+use crate::config::Config;
 use crate::permissions::PermissionMode;
+use crate::tools::lsp::LspManager;
+use crate::tools::task_store::TaskStore;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Simplified tool info for building API definitions.
 pub struct ToolDefInfo {
@@ -23,10 +41,15 @@ pub struct ToolDefInfo {
 }
 
 /// Context provided to tools during execution.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolContext {
     pub cwd: PathBuf,
-    pub permission_mode: PermissionMode,
+    pub permission_mode: Arc<Mutex<PermissionMode>>,
+    pub task_store: Arc<Mutex<TaskStore>>,
+    pub api_client: Arc<ApiClient>,
+    pub config: Config,
+    pub lsp_manager: Arc<Mutex<LspManager>>,
+    pub plan_file_path: Arc<Mutex<Option<PathBuf>>>,
 }
 
 /// Result returned by a tool execution.
@@ -117,6 +140,8 @@ impl ToolRegistry {
 /// Build the default tool registry with all built-in tools.
 pub fn build_default_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
+
+    // Core tools
     registry.register(Box::new(bash::BashTool));
     registry.register(Box::new(read::ReadTool));
     registry.register(Box::new(write::WriteTool));
@@ -125,5 +150,35 @@ pub fn build_default_registry() -> ToolRegistry {
     registry.register(Box::new(grep::GrepTool));
     registry.register(Box::new(web_fetch::WebFetchTool));
     registry.register(Box::new(ask_user::AskUserTool));
+
+    // Task management
+    registry.register(Box::new(task_create::TaskCreateTool));
+    registry.register(Box::new(task_update::TaskUpdateTool));
+    registry.register(Box::new(task_list::TaskListTool));
+    registry.register(Box::new(task_get::TaskGetTool));
+
+    // Agent (sub-agents)
+    registry.register(Box::new(agent::AgentTool));
+
+    // Plan mode
+    registry.register(Box::new(plan_mode::EnterPlanModeTool));
+    registry.register(Box::new(plan_mode::ExitPlanModeTool));
+
+    // Web search
+    registry.register(Box::new(web_search::WebSearchTool));
+
+    // LSP code intelligence
+    registry.register(Box::new(lsp::LspTool));
+
+    // Jupyter notebook editing
+    registry.register(Box::new(notebook_edit::NotebookEditTool));
+
+    // Git worktree
+    registry.register(Box::new(worktree::EnterWorktreeTool));
+    registry.register(Box::new(worktree::ExitWorktreeTool));
+
+    // Skills
+    registry.register(Box::new(skill::SkillTool));
+
     registry
 }

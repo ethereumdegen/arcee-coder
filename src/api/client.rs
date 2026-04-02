@@ -114,8 +114,8 @@ impl ApiClient {
         messages: Vec<ChatMessage>,
         tools: Vec<ToolDefinition>,
         max_tokens: u32,
-        on_text: &mut dyn FnMut(&str),
-        on_tool_use_start: &mut dyn FnMut(&str, &str),
+        on_text: &mut (dyn FnMut(&str) + Send),
+        on_tool_use_start: &mut (dyn FnMut(&str, &str) + Send),
     ) -> Result<(Vec<ContentBlock>, StopReason, Usage), ApiError> {
         self.send_message_with_model(
             &self.model,
@@ -137,14 +137,20 @@ impl ApiClient {
         messages: Vec<ChatMessage>,
         tools: Vec<ToolDefinition>,
         max_tokens: u32,
-        on_text: &mut dyn FnMut(&str),
-        on_tool_use_start: &mut dyn FnMut(&str, &str),
+        on_text: &mut (dyn FnMut(&str) + Send),
+        on_tool_use_start: &mut (dyn FnMut(&str, &str) + Send),
     ) -> Result<(Vec<ContentBlock>, StopReason, Usage), ApiError> {
         let retry_config = RetryConfig::default();
 
         // Prepend system message
         let mut all_messages = vec![ChatMessage::system(system_prompt)];
         all_messages.extend(messages);
+
+        let tool_choice = if tools.is_empty() {
+            None
+        } else {
+            Some(serde_json::json!("auto"))
+        };
 
         let request = ChatCompletionRequest {
             model: model.to_string(),
@@ -153,8 +159,27 @@ impl ApiClient {
             temperature: None,
             stream: Some(true),
             tools,
-            tool_choice: None,
+            tool_choice,
         };
+
+        // Debug: log request summary when ARCEE_DEBUG=1
+        if std::env::var("ARCEE_DEBUG").is_ok() {
+            eprintln!("\x1b[90m[DEBUG] API request: model={}, messages={}, tools={}\x1b[0m",
+                request.model,
+                request.messages.len(),
+                request.tools.len(),
+            );
+            for tool in &request.tools {
+                eprintln!("\x1b[90m[DEBUG]   tool: {} (params: {})\x1b[0m",
+                    tool.function.name,
+                    serde_json::to_string(&tool.function.parameters)
+                        .unwrap_or_default()
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                );
+            }
+        }
 
         let mut stream = with_retry(&retry_config, || {
             let req = request.clone();
@@ -194,14 +219,43 @@ impl ApiClient {
             accum.process_chunk(&chunk);
         }
 
-        let stop_reason = accum
-            .finish_reason
-            .as_deref()
-            .map(StopReason::from_api)
-            .unwrap_or(StopReason::EndTurn);
+        // Debug: log accumulated tool calls before converting
+        if std::env::var("ARCEE_DEBUG").is_ok() {
+            for (i, tc) in accum.tool_calls.iter().enumerate() {
+                eprintln!(
+                    "\x1b[90m[DEBUG] tool_call[{i}]: name={:?}, id={:?}, args_len={}, args={:?}\x1b[0m",
+                    tc.name,
+                    tc.id,
+                    tc.arguments.len(),
+                    &tc.arguments[..tc.arguments.len().min(300)]
+                );
+            }
+            eprintln!(
+                "\x1b[90m[DEBUG] finish_reason={:?}, text_len={}\x1b[0m",
+                accum.finish_reason,
+                accum.text.len()
+            );
+        }
 
         let usage = accum.usage.clone();
+        let finish_reason = accum.finish_reason.clone();
         let content = accum.into_content_blocks();
+
+        // Determine stop reason: if there are tool calls in content, treat as ToolUse
+        // regardless of what finish_reason says (some APIs return "stop" with tool calls).
+        // If finish_reason is missing (stream disconnect), check content to decide.
+        let has_tool_calls = content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+        let stop_reason = if has_tool_calls {
+            StopReason::ToolUse
+        } else if let Some(ref reason) = finish_reason {
+            StopReason::from_api(reason)
+        } else {
+            // No finish_reason received — stream may have ended prematurely
+            eprintln!(
+                "\x1b[33m[warning: stream ended without finish_reason]\x1b[0m"
+            );
+            StopReason::EndTurn
+        };
 
         Ok((content, stop_reason, usage))
     }
