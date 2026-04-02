@@ -1,8 +1,8 @@
-# Arcee Code
+# Arcee Coder
 
 ## An AI-Powered Coding Assistant CLI
 
-Arcee Code is a Rust-based command-line interface that leverages Arcee AI to provide intelligent coding assistance. This tool integrates with various development workflows to help developers write, debug, and refactor code more efficiently.
+Arcee Coder is an unofficial Rust-based command-line interface that leverages Arcee AI to provide intelligent coding assistance. This tool integrates with various development workflows to help developers write, debug, and refactor code more efficiently.
 
 ## Features
 - **AI-Powered Assistance**: Uses Arcee AI to generate code suggestions, explain concepts, and provide debugging insights
@@ -14,10 +14,10 @@ Arcee Code is a Rust-based command-line interface that leverages Arcee AI to pro
 ## Installation
 ```bash
 # Clone the repository
-git clone https://github.com/andy-ai/arcee-code.git
+git clone https://github.com/andy-ai/arcee-coder.git
 
 # Navigate to the project directory
-cd arcee-code
+cd arcee-coder
 
 # Run locally
 cargo r
@@ -29,13 +29,13 @@ cargo install --path .
 ## Usage
 ```bash
 # Start the assistant
-arcee
+arcee-coder
 
 # Generate code
-arcee generate --language rust --template function
+arcee-coder generate --language rust --template function
 
 # Get help
-arcee --help
+arcee-coder --help
 ```
 
 ## Contributing
