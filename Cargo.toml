@@ -1,0 +1,36 @@
+[package]
+name = "arcee-code"
+version = "0.1.0"
+edition = "2021"
+description = "An AI coding assistant CLI, powered by Arcee AI"
+
+[[bin]]
+name = "arcee"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["stream", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+ratatui = "0.29"
+glob = "0.3"
+regex = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+futures = "0.3"
+tokio-stream = "0.1"
+syntect = "5"
+indicatif = "0.17"
+colored = "3"
+walkdir = "2"
+ignore = "0.4"
+html2text = "0.12"
+rustyline = { version = "14", features = ["derive"] }
+bytes = "1"
