@@ -66,7 +66,7 @@ fn default_base_url() -> String {
 }
 
 fn default_max_turns() -> usize {
-    50
+    200
 }
 
 fn default_max_tokens() -> u32 {

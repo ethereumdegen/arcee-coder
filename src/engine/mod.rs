@@ -25,6 +25,8 @@ const AUTO_COMPACT_KEEP_RECENT: usize = 10;
 const MAX_OUTPUT_RECOVERY_ATTEMPTS: u32 = 3;
 /// Max retries for transient API errors (rate-limit, server errors, network).
 const MAX_API_RETRIES: u32 = 3;
+/// Max times the same tool call can repeat before we inject a stuck-loop warning.
+const MAX_REPEATED_TOOL_CALLS: usize = 3;
 
 /// Run the main query loop: send messages to the API, execute tool calls, repeat.
 pub async fn query_loop(
@@ -41,6 +43,9 @@ pub async fn query_loop(
     let mut turns = 0;
     let mut max_tokens_recoveries: u32 = 0;
     let mut last_tool_names: Vec<String> = Vec::new();
+    // Track repeated tool calls: (tool_name, input_hash) -> consecutive count
+    let mut last_tool_signature: Option<String> = None;
+    let mut repeated_tool_count: usize = 0;
 
     loop {
         // Auto-compaction check
@@ -245,6 +250,55 @@ pub async fn query_loop(
                 .collect();
 
             last_tool_names = tool_uses.iter().map(|(_, n, _)| n.clone()).collect();
+
+            // Stuck-loop detection: hash current tool calls and compare to previous turn
+            let current_signature = {
+                let mut sig_parts: Vec<String> = tool_uses
+                    .iter()
+                    .map(|(_, name, input)| format!("{}:{}", name, input))
+                    .collect();
+                sig_parts.sort();
+                sig_parts.join("|")
+            };
+
+            if Some(&current_signature) == last_tool_signature.as_ref() {
+                repeated_tool_count += 1;
+            } else {
+                repeated_tool_count = 1;
+                last_tool_signature = Some(current_signature);
+            }
+
+            if repeated_tool_count >= MAX_REPEATED_TOOL_CALLS {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "[stuck-loop detected: same tool call repeated {} times, injecting warning]",
+                        repeated_tool_count
+                    )
+                    .yellow()
+                );
+                // Don't execute the tools again — inject a warning instead
+                let tool_names: Vec<_> = tool_uses.iter().map(|(_, n, _)| n.as_str()).collect();
+                let warning = format!(
+                    "STOP: You have called the exact same tool(s) ({}) with the exact same arguments {} times in a row, getting the same result each time. \
+                     This is a stuck loop. You MUST try a completely different approach. \
+                     Do NOT retry the same command. Either:\n\
+                     1. Fix the underlying issue (e.g. wrong parameters, missing config)\n\
+                     2. Ask the user for help\n\
+                     3. Explain what went wrong and stop",
+                    tool_names.join(", "),
+                    repeated_tool_count
+                );
+                // Add dummy tool results so the conversation stays valid
+                let results: Vec<_> = tool_uses
+                    .iter()
+                    .map(|(id, _, _)| (id.clone(), warning.clone(), true))
+                    .collect();
+                messages.push(Message::tool_results(results));
+                turns += 1;
+                continue;
+            }
+
             let mut results = Vec::new();
 
             for (id, name, input) in &tool_uses {
