@@ -165,6 +165,12 @@ fn classify_single_command(cmd: &str) -> DangerLevel {
         "git show",
         "git branch",
         "git remote",
+        "git add",
+        "git stash",
+        "git tag",
+        "git fetch",
+        "git commit",
+        "git push",
         "cargo build",
         "cargo test",
         "cargo check",
@@ -187,7 +193,7 @@ fn classify_single_command(cmd: &str) -> DangerLevel {
 
     // Check moderate patterns
     let moderate_indicators: &[&str] = &[
-        "rm", "mv", "chmod", "chown", "kill", "pkill", "sudo", "git push", "git reset",
+        "rm", "mv", "chmod", "chown", "kill", "pkill", "sudo", "git reset",
         "git checkout --", "git restore .", "curl | sh", "wget", "npm install", "pip install",
         "apt", "brew install",
     ];
@@ -390,7 +396,7 @@ mod tests {
     #[test]
     fn test_classify_bash_danger_moderate() {
         assert_eq!(classify_bash_danger("rm foo.txt"), DangerLevel::Moderate);
-        assert_eq!(classify_bash_danger("git push origin main"), DangerLevel::Moderate);
+        assert_eq!(classify_bash_danger("git push origin main"), DangerLevel::Safe);
         assert_eq!(classify_bash_danger("mv a.txt b.txt"), DangerLevel::Moderate);
         assert_eq!(classify_bash_danger("npm install express"), DangerLevel::Moderate);
         assert_eq!(classify_bash_danger("sudo apt update"), DangerLevel::Moderate);
@@ -419,7 +425,11 @@ mod tests {
         );
         assert_eq!(
             classify_bash_danger("cargo test && git push"),
-            DangerLevel::Moderate
+            DangerLevel::Safe
+        );
+        assert_eq!(
+            classify_bash_danger("cargo test && git push --force"),
+            DangerLevel::Destructive
         );
     }
 
