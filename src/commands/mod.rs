@@ -1,5 +1,7 @@
+use crate::config::Config;
 use crate::engine::cost::CostTracker;
 use crate::messages::types::Message;
+use crate::permissions::PermissionStrictness;
 use colored::Colorize;
 
 /// Handle a slash command. Returns true if the command was handled.
@@ -7,8 +9,9 @@ pub fn handle_command(
     input: &str,
     messages: &mut Vec<Message>,
     cost_tracker: &CostTracker,
-    model: &str,
+    config: &mut Config,
 ) -> bool {
+    let model = config.model.as_str();
     let parts: Vec<&str> = input.trim().splitn(2, ' ').collect();
     let cmd = parts[0];
     let args = parts.get(1).copied().unwrap_or("");
@@ -64,6 +67,46 @@ pub fn handle_command(
             }
             true
         }
+        "/permission-strictness" | "/strictness" => {
+            if args.is_empty() {
+                let current = match config.permission_strictness {
+                    PermissionStrictness::High => "high",
+                    PermissionStrictness::Medium => "medium",
+                    PermissionStrictness::Low => "low",
+                };
+                println!("Current permission strictness: {}", current.green());
+                println!("  {} — prompt for all non-read-only tools", "high".cyan());
+                println!(
+                    "  {} — auto-allow safe bash commands, prompt for moderate+",
+                    "medium".cyan()
+                );
+                println!(
+                    "  {} — only prompt for destructive bash commands",
+                    "low".cyan()
+                );
+                println!("Usage: /permission-strictness <high|medium|low>");
+            } else {
+                let new_strictness = match args.trim().to_lowercase().as_str() {
+                    "high" => PermissionStrictness::High,
+                    "medium" => PermissionStrictness::Medium,
+                    "low" => PermissionStrictness::Low,
+                    _ => {
+                        println!(
+                            "{}",
+                            format!("Unknown strictness level: {args}. Use high, medium, or low.")
+                                .yellow()
+                        );
+                        return true;
+                    }
+                };
+                config.permission_strictness = new_strictness;
+                println!(
+                    "{}",
+                    format!("Permission strictness set to: {args}.").green()
+                );
+            }
+            true
+        }
         "/tokens" => {
             let estimated = crate::engine::compact::estimate_tokens(messages);
             println!(
@@ -100,6 +143,7 @@ Available commands:
   /compact   Compress conversation context
   /cost      Show token usage and estimated cost
   /model     Show or switch model (trinity-mini, trinity-large-thinking)
+  /strictness  Show or set permission strictness (high, medium, low)
   /tokens    Show estimated token count
   /history   Show conversation summary
   /quit      Exit arcee-code

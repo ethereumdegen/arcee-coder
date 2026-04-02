@@ -1,6 +1,6 @@
 pub mod paths;
 
-use crate::permissions::PermissionMode;
+use crate::permissions::{PermissionMode, PermissionStrictness};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -18,6 +18,9 @@ pub struct Config {
 
     #[serde(default)]
     pub permission_mode: PermissionMode,
+
+    #[serde(default)]
+    pub permission_strictness: PermissionStrictness,
 
     #[serde(default = "default_max_turns")]
     pub max_turns: usize,
@@ -81,6 +84,7 @@ impl Default for Config {
             api_key: String::new(),
             base_url: default_base_url(),
             permission_mode: PermissionMode::Default,
+            permission_strictness: PermissionStrictness::default(),
             max_turns: default_max_turns(),
             max_tokens: default_max_tokens(),
             budget_usd: None,
@@ -107,6 +111,7 @@ impl Config {
                 Ok(file_config) => {
                     config.model = file_config.model;
                     config.permission_mode = file_config.permission_mode;
+                    config.permission_strictness = file_config.permission_strictness;
                     config.max_turns = file_config.max_turns;
                     config.max_tokens = file_config.max_tokens;
                     config.allow_rules = file_config.allow_rules;
@@ -142,6 +147,11 @@ impl Config {
                         serde_json::from_value(serde_json::Value::String(mode.to_string()))
                             .unwrap_or(config.permission_mode);
                 }
+                if let Some(s) = proj_config["permission_strictness"].as_str() {
+                    config.permission_strictness =
+                        serde_json::from_value(serde_json::Value::String(s.to_string()))
+                            .unwrap_or(config.permission_strictness);
+                }
             }
         }
 
@@ -155,6 +165,13 @@ impl Config {
         if let Ok(model) = std::env::var("ARCEE_MODEL") {
             config.model = model;
         }
+        if let Ok(s) = std::env::var("ARCEE_PERMISSION_STRICTNESS") {
+            config.permission_strictness = match s.to_lowercase().as_str() {
+                "high" => PermissionStrictness::High,
+                "low" => PermissionStrictness::Low,
+                _ => PermissionStrictness::Medium,
+            };
+        }
 
         // 4. CLI overrides (highest priority)
         if let Some(ref model) = cli.model {
@@ -162,6 +179,9 @@ impl Config {
         }
         if let Some(mode) = cli.permission_mode {
             config.permission_mode = mode;
+        }
+        if let Some(s) = cli.permission_strictness {
+            config.permission_strictness = s;
         }
         if let Some(turns) = cli.max_turns {
             config.max_turns = turns;
@@ -197,4 +217,5 @@ pub struct CliOverrides {
     pub resume: bool,
     pub prompt: Option<String>,
     pub no_auto_route: bool,
+    pub permission_strictness: Option<PermissionStrictness>,
 }

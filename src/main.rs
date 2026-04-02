@@ -3,7 +3,7 @@ use clap::Parser;
 use colored::Colorize;
 
 use arcee_code::config::{CliOverrides, Config};
-use arcee_code::permissions::PermissionMode;
+use arcee_code::permissions::{PermissionMode, PermissionStrictness};
 use arcee_code::session::Session;
 
 #[derive(Parser)]
@@ -43,6 +43,10 @@ struct Cli {
     /// Disable adaptive model routing (always use the configured model)
     #[arg(long)]
     no_auto_route: bool,
+
+    /// Permission strictness: high, medium, low
+    #[arg(long)]
+    permission_strictness: Option<String>,
 }
 
 #[tokio::main]
@@ -56,6 +60,12 @@ async fn main() -> Result<()> {
         _ => PermissionMode::Default,
     });
 
+    let perm_strictness = cli.permission_strictness.as_deref().map(|s| match s {
+        "high" => PermissionStrictness::High,
+        "low" => PermissionStrictness::Low,
+        _ => PermissionStrictness::Medium,
+    });
+
     let overrides = CliOverrides {
         model: cli.model,
         permission_mode: perm_mode,
@@ -64,6 +74,7 @@ async fn main() -> Result<()> {
         verbose: cli.verbose,
         resume: cli.resume,
         no_auto_route: cli.no_auto_route,
+        permission_strictness: perm_strictness,
         prompt: if cli.prompt.is_empty() {
             None
         } else {

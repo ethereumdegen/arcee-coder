@@ -8,6 +8,9 @@ use std::time::Duration;
 ///
 /// Ported from the `unicode-animations` npm package's "rain" animation
 /// used by stark-bot.
+///
+/// Renders on its own line above the cursor so typed-ahead user input
+/// on the line below is not clobbered.
 pub struct ThinkingIndicator {
     running: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
@@ -72,6 +75,12 @@ fn grid_to_braille(grid: &[[bool; 8]; 4]) -> String {
 
 impl ThinkingIndicator {
     /// Start the thinking indicator animation on a background thread.
+    ///
+    /// Layout:
+    /// ```text
+    ///   thinking ⣀⠤⠊⠉    ← animation line (updated in-place)
+    ///   user types here_   ← cursor stays here, undisturbed
+    /// ```
     pub fn start() -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let r = running.clone();
@@ -79,19 +88,32 @@ impl ThinkingIndicator {
         let handle = thread::spawn(move || {
             let frames = gen_rain_frames();
             let label = "\x1b[2m\x1b[3mthinking\x1b[0m "; // dimmed italic
-            let mut frame_idx = 0;
+            // Print animation line + newline to create the two-line layout.
+            // Cursor ends up on the line below (the "typing" line).
+            let frame = &frames[0];
+            print!("{label}{frame}\x1b[K\n");
+            let _ = std::io::stdout().flush();
+            let mut frame_idx = 1;
 
             while r.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(100));
+                if !r.load(Ordering::Relaxed) {
+                    break;
+                }
+
                 let frame = &frames[frame_idx % frames.len()];
-                // \r moves to start of line, write label + animation, clear rest of line
-                print!("\r{label}{frame}\x1b[K");
+
+                // Save cursor → move up one line → overwrite animation → restore cursor
+                print!("\x1b7\x1b[A\r{label}{frame}\x1b[K\x1b8");
                 let _ = std::io::stdout().flush();
                 frame_idx += 1;
-                thread::sleep(Duration::from_millis(100));
             }
 
-            // Clear the line when done
-            print!("\r\x1b[K");
+            // Clean up both lines:
+            // 1. Clear the typing line (cursor is here; typed text is safe in stdin buffer)
+            // 2. Move up to animation line and clear it
+            // Cursor ends up on the animation line, ready for streaming output.
+            print!("\r\x1b[K\x1b[A\r\x1b[K");
             let _ = std::io::stdout().flush();
         });
 

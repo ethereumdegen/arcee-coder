@@ -214,6 +214,7 @@ pub async fn query_loop(
                     config.permission_mode,
                     &config.allow_rules,
                     &config.deny_rules,
+                    config.permission_strictness,
                 );
 
                 let allowed = match perm {
