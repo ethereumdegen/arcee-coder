@@ -1,184 +1,164 @@
+use crate::api::client::ApiClient;
 use crate::config::Config;
 use crate::engine::cost::CostTracker;
 use crate::engine::model_router::Intensity;
 use crate::messages::types::Message;
 use crate::permissions::PermissionStrictness;
-use colored::Colorize;
+use std::fmt::Write;
 
-/// Handle a slash command. Returns true if the command was handled.
-pub fn handle_command(
+/// Result of a slash command.
+pub enum CommandResult {
+    /// Command handled, output to display.
+    Output(String),
+    /// User wants to exit.
+    Exit,
+    /// Unknown command.
+    Unknown(String),
+}
+
+/// Handle a slash command. Returns the output to display.
+pub async fn handle_command(
     input: &str,
     messages: &mut Vec<Message>,
     cost_tracker: &CostTracker,
     config: &mut Config,
-) -> bool {
+    client: &ApiClient,
+) -> CommandResult {
     let model = config.model.as_str();
     let parts: Vec<&str> = input.trim().splitn(2, ' ').collect();
     let cmd = parts[0];
     let args = parts.get(1).copied().unwrap_or("");
 
     match cmd {
-        "/help" => {
-            print_help();
-            true
-        }
+        "/help" => CommandResult::Output(help_text()),
         "/clear" => {
             messages.clear();
-            println!("{}", "Conversation cleared.".green());
-            true
+            CommandResult::Output("Conversation cleared.".to_string())
         }
         "/compact" => {
             let before = messages.len();
             let tokens_before = crate::engine::compact::estimate_tokens(messages);
-            let compacted = crate::engine::compact::compact_messages(messages, 6);
-            *messages = compacted;
+            *messages = crate::engine::compact::compact_messages_ai(
+                client,
+                crate::engine::model_router::MODEL_LIGHT,
+                messages,
+                6,
+            )
+            .await;
             let tokens_after = crate::engine::compact::estimate_tokens(messages);
-            println!(
-                "{}",
-                format!(
-                    "Compacted: {} → {} messages (~{} → ~{} tokens)",
-                    before,
-                    messages.len(),
-                    tokens_before,
-                    tokens_after
-                )
-                .green()
-            );
-            true
+            CommandResult::Output(format!(
+                "Compacted: {} → {} messages (~{} → ~{} tokens)",
+                before,
+                messages.len(),
+                tokens_before,
+                tokens_after
+            ))
         }
-        "/cost" => {
-            println!("{}", cost_tracker.summary(model));
-            true
-        }
+        "/cost" => CommandResult::Output(cost_tracker.summary(model)),
         "/model" => {
+            let mut out = String::new();
             if args.is_empty() {
-                println!("Current model: {}", model.green());
-                println!("Available: trinity-mini, trinity-large-thinking");
-                println!("Usage: /model <name>");
+                let _ = writeln!(out, "Current model: {model}");
+                let _ = writeln!(out, "Available: trinity-mini, trinity-large-thinking");
+                let _ = write!(out, "Usage: /model <name>");
             } else {
-                // Model switching is informational — actual switch happens in config
-                println!(
-                    "{}",
-                    format!("Model set to: {args}. Will apply to next API call.").green()
-                );
-                println!(
-                    "{}",
-                    "Note: use --model flag or ARCEE_MODEL env var to persist.".dimmed()
+                let _ = writeln!(out, "Model set to: {args}. Will apply to next API call.");
+                let _ = write!(
+                    out,
+                    "Note: use --model flag or ARCEE_MODEL env var to persist."
                 );
             }
-            true
+            CommandResult::Output(out)
         }
         "/permission-strictness" | "/strictness" => {
+            let mut out = String::new();
             if args.is_empty() {
                 let current = match config.permission_strictness {
                     PermissionStrictness::High => "high",
                     PermissionStrictness::Medium => "medium",
                     PermissionStrictness::Low => "low",
                 };
-                println!("Current permission strictness: {}", current.green());
-                println!("  {} — prompt for all non-read-only tools", "high".cyan());
-                println!(
-                    "  {} — auto-allow safe bash commands, prompt for moderate+",
-                    "medium".cyan()
+                let _ = writeln!(out, "Current permission strictness: {current}");
+                let _ = writeln!(out, "  high — prompt for all non-read-only tools");
+                let _ = writeln!(
+                    out,
+                    "  medium — auto-allow safe bash commands, prompt for moderate+"
                 );
-                println!(
-                    "  {} — only prompt for destructive bash commands",
-                    "low".cyan()
-                );
-                println!("Usage: /permission-strictness <high|medium|low>");
+                let _ = writeln!(out, "  low — only prompt for destructive bash commands");
+                let _ = write!(out, "Usage: /permission-strictness <high|medium|low>");
             } else {
                 let new_strictness = match args.trim().to_lowercase().as_str() {
                     "high" => PermissionStrictness::High,
                     "medium" => PermissionStrictness::Medium,
                     "low" => PermissionStrictness::Low,
                     _ => {
-                        println!(
-                            "{}",
-                            format!("Unknown strictness level: {args}. Use high, medium, or low.")
-                                .yellow()
-                        );
-                        return true;
+                        return CommandResult::Output(format!(
+                            "Unknown strictness level: {args}. Use high, medium, or low."
+                        ));
                     }
                 };
                 config.permission_strictness = new_strictness;
-                println!(
-                    "{}",
-                    format!("Permission strictness set to: {args}.").green()
-                );
+                let _ = write!(out, "Permission strictness set to: {args}.");
             }
-            true
+            CommandResult::Output(out)
         }
         "/intensity" => {
+            let mut out = String::new();
             if args.is_empty() {
                 let current = config.intensity;
-                println!("Current intensity: {}", current.as_str().green());
-                println!();
+                let _ = writeln!(out, "Current intensity: {}", current.as_str());
+                let _ = writeln!(out);
                 for level in &[Intensity::High, Intensity::Medium, Intensity::Low] {
                     let marker = if *level == current { " <--" } else { "" };
-                    println!(
+                    let _ = writeln!(
+                        out,
                         "  {} — {}{}",
-                        level.as_str().cyan(),
+                        level.as_str(),
                         level.description(),
-                        marker.green()
+                        marker
                     );
                 }
-                println!();
-                println!("Usage: /intensity <high|medium|low>");
+                let _ = writeln!(out);
+                let _ = write!(out, "Usage: /intensity <high|medium|low>");
             } else {
                 match Intensity::from_str(args.trim()) {
                     Some(new_intensity) => {
                         config.intensity = new_intensity;
-                        println!(
-                            "{}",
-                            format!(
-                                "Intensity set to: {} — {}",
-                                new_intensity.as_str(),
-                                new_intensity.description()
-                            )
-                            .green()
+                        let _ = write!(
+                            out,
+                            "Intensity set to: {} — {}",
+                            new_intensity.as_str(),
+                            new_intensity.description()
                         );
                     }
                     None => {
-                        println!(
-                            "{}",
-                            format!("Unknown intensity: {args}. Use high, medium, or low.").yellow()
+                        let _ = write!(
+                            out,
+                            "Unknown intensity: {args}. Use high, medium, or low."
                         );
                     }
                 }
             }
-            true
+            CommandResult::Output(out)
         }
         "/tokens" => {
             let estimated = crate::engine::compact::estimate_tokens(messages);
-            println!(
+            CommandResult::Output(format!(
                 "Estimated context: ~{} tokens ({} messages)",
                 estimated,
                 messages.len()
-            );
-            true
+            ))
         }
-        "/history" => {
-            print_history(messages);
-            true
-        }
-        "/quit" | "/exit" | "/q" => {
-            std::process::exit(0);
-        }
-        _ => {
-            println!(
-                "{}",
-                format!("Unknown command: {cmd}. Type /help for available commands.").yellow()
-            );
-            true
-        }
+        "/history" => CommandResult::Output(format_history(messages)),
+        "/quit" | "/exit" | "/q" => CommandResult::Exit,
+        _ => CommandResult::Unknown(format!(
+            "Unknown command: {cmd}. Type /help for available commands."
+        )),
     }
 }
 
-fn print_help() {
-    println!(
-        "{}",
-        r#"
-Available commands:
+fn help_text() -> String {
+    r#"Available commands:
   /help      Show this help message
   /clear     Clear the conversation
   /compact   Compress conversation context
@@ -191,24 +171,22 @@ Available commands:
   /quit      Exit arcee-code
 
 Keyboard shortcuts:
-  Ctrl+C     Interrupt current generation
+  ESC        Interrupt current generation
   Ctrl+D     Exit
 
 Environment variables:
   ARCEE_API_KEY     Your Arcee API key
   ARCEE_BASE_URL    Custom API endpoint
-  ARCEE_MODEL       Default model override
-"#
-        .trim()
-    );
+  ARCEE_MODEL       Default model override"#
+        .to_string()
 }
 
-fn print_history(messages: &[Message]) {
+fn format_history(messages: &[Message]) -> String {
     if messages.is_empty() {
-        println!("{}", "No messages yet.".dimmed());
-        return;
+        return "No messages yet.".to_string();
     }
 
+    let mut out = String::new();
     for (i, msg) in messages.iter().enumerate() {
         match msg {
             Message::User(u) => {
@@ -222,7 +200,7 @@ fn print_history(messages: &[Message]) {
                     .collect::<Vec<_>>()
                     .join(" ");
                 let preview: String = text.chars().take(80).collect();
-                println!("{:>3}. {} {}", i + 1, "User:".blue(), preview);
+                let _ = writeln!(out, "{:>3}. User: {}", i + 1, preview);
             }
             Message::Assistant(a) => {
                 let text: String = a
@@ -235,17 +213,13 @@ fn print_history(messages: &[Message]) {
                     .collect::<Vec<_>>()
                     .join(" ");
                 let preview: String = text.chars().take(80).collect();
-                println!("{:>3}. {} {}", i + 1, "Arcee:".green(), preview);
+                let _ = writeln!(out, "{:>3}. Arcee: {}", i + 1, preview);
             }
             Message::System(s) => {
                 let preview: String = s.content.chars().take(80).collect();
-                println!(
-                    "{:>3}. {} {}",
-                    i + 1,
-                    "System:".yellow(),
-                    preview
-                );
+                let _ = writeln!(out, "{:>3}. System: {}", i + 1, preview);
             }
         }
     }
+    out
 }

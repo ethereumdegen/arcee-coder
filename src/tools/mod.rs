@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod ask_user;
+pub mod background_tasks;
 pub mod bash;
 pub mod edit;
 pub mod glob;
@@ -13,6 +14,7 @@ pub mod skill;
 pub mod task_create;
 pub mod task_get;
 pub mod task_list;
+pub mod task_output;
 pub mod task_store;
 pub mod task_update;
 pub mod web_fetch;
@@ -24,6 +26,7 @@ use crate::api::client::ApiClient;
 use crate::api::types::ToolDefinition;
 use crate::config::Config;
 use crate::permissions::PermissionMode;
+use crate::tools::background_tasks::BackgroundTaskStore;
 use crate::tools::lsp::LspManager;
 use crate::tools::task_store::TaskStore;
 use anyhow::Result;
@@ -46,6 +49,7 @@ pub struct ToolContext {
     pub cwd: PathBuf,
     pub permission_mode: Arc<Mutex<PermissionMode>>,
     pub task_store: Arc<Mutex<TaskStore>>,
+    pub background_tasks: Arc<Mutex<BackgroundTaskStore>>,
     pub api_client: Arc<ApiClient>,
     pub config: Config,
     pub lsp_manager: Arc<Mutex<LspManager>>,
@@ -156,6 +160,7 @@ pub fn build_default_registry() -> ToolRegistry {
     registry.register(Box::new(task_update::TaskUpdateTool));
     registry.register(Box::new(task_list::TaskListTool));
     registry.register(Box::new(task_get::TaskGetTool));
+    registry.register(Box::new(task_output::TaskOutputTool));
 
     // Agent (sub-agents)
     registry.register(Box::new(agent::AgentTool));

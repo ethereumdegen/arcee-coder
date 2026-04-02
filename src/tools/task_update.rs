@@ -13,7 +13,34 @@ impl Tool for TaskUpdateTool {
     }
 
     fn description(&self) -> String {
-        "Update an existing task's status, subject, description, owner, dependencies, or metadata.".to_string()
+        r#"Use this tool to update a task in the task list.
+
+## When to Use This Tool
+
+**Mark tasks as in_progress:**
+- When you START working on a task, mark it in_progress BEFORE beginning work
+
+**Mark tasks as completed:**
+- When you have FULLY completed the work described in a task
+- IMPORTANT: Always mark your tasks as completed when you finish them
+- After completing, call TaskList to find your next task
+
+- ONLY mark a task as completed when you have FULLY accomplished it
+- If you encounter errors, blockers, or cannot finish, keep the task as in_progress
+- When blocked, create a new task describing what needs to be resolved
+- Never mark a task as completed if:
+  - Tests are failing
+  - Implementation is partial
+  - You encountered unresolved errors
+
+**Delete tasks:**
+- When a task is no longer relevant or was created in error
+
+## Status Workflow
+
+Status progresses: `pending` → `in_progress` → `completed`
+Use `deleted` to permanently remove a task."#
+            .to_string()
     }
 
     fn input_schema(&self) -> serde_json::Value {

@@ -107,9 +107,9 @@ fn find_matching_files(
     for entry in glob::glob(&pattern_str).map_err(|e| format!("Invalid glob pattern: {e}"))? {
         match entry {
             Ok(path) => files.push(path),
-            Err(e) => {
-                // Skip permission errors, etc.
-                eprintln!("Glob entry error: {e}");
+            Err(_) => {
+                // Skip permission errors, etc. — these are expected for
+                // inaccessible directories and don't need to be reported.
             }
         }
     }

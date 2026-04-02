@@ -59,6 +59,10 @@ pub struct Config {
     /// Dynamic pricing table fetched from the API on boot.
     #[serde(skip)]
     pub pricing_table: PricingTable,
+
+    /// Hooks configuration for PreToolUse / PostToolUse events.
+    #[serde(default)]
+    pub hooks: crate::hooks::HooksConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +110,7 @@ impl Default for Config {
             auto_model_routing: default_auto_routing(),
             intensity: Intensity::default(),
             pricing_table: PricingTable::new(),
+            hooks: Default::default(),
         }
     }
 }
@@ -130,6 +135,7 @@ impl Config {
                     config.deny_rules = file_config.deny_rules;
                     config.auto_model_routing = file_config.auto_model_routing;
                     config.intensity = file_config.intensity;
+                    config.hooks = file_config.hooks;
                 }
                 Err(e) => {
                     eprintln!(
@@ -164,6 +170,14 @@ impl Config {
                     config.permission_strictness =
                         serde_json::from_value(serde_json::Value::String(s.to_string()))
                             .unwrap_or(config.permission_strictness);
+                }
+                // Merge project-level hooks (additive on top of user-level)
+                if let Ok(proj_hooks) =
+                    serde_json::from_value::<crate::hooks::HooksConfig>(
+                        proj_config["hooks"].clone(),
+                    )
+                {
+                    crate::hooks::merge(&mut config.hooks, proj_hooks);
                 }
             }
         }

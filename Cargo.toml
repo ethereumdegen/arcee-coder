@@ -15,7 +15,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
-ratatui = "0.29"
 glob = "0.3"
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -27,7 +26,9 @@ async-trait = "0.1"
 futures = "0.3"
 tokio-stream = "0.1"
 syntect = "5"
-indicatif = "0.17"
+iocraft = "0.8"
+smol = "2"
+crossbeam-channel = "0.5"
 colored = "3"
 walkdir = "2"
 ignore = "0.4"

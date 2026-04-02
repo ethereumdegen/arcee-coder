@@ -10,6 +10,8 @@ use crate::messages::normalize::normalize_for_api;
 use crate::messages::types::*;
 use crate::permissions;
 use crate::tools::{ToolContext, ToolRegistry};
+use crate::ui::bridge::UiBridge;
+use crate::ui::events::StatusLevel;
 use crate::ui::thinking::ThinkingIndicator;
 use anyhow::Result;
 use colored::Colorize;
@@ -32,6 +34,68 @@ const MAX_EMPTY_END_TURN: u32 = 3;
 /// Max times the same tool call can repeat before we inject a stuck-loop warning.
 const MAX_REPEATED_TOOL_CALLS: usize = 3;
 
+/// Helper for outputting messages either through the bridge or direct println.
+struct Output<'a> {
+    bridge: Option<&'a UiBridge>,
+}
+
+impl<'a> Output<'a> {
+    fn new(bridge: Option<&'a UiBridge>) -> Self {
+        Self { bridge }
+    }
+
+    fn status_dim(&self, msg: &str) {
+        if let Some(b) = self.bridge {
+            b.status(msg, StatusLevel::Dim);
+        } else {
+            eprintln!("{}", msg.dimmed());
+        }
+    }
+
+    fn status_warn(&self, msg: &str) {
+        if let Some(b) = self.bridge {
+            b.status(msg, StatusLevel::Warning);
+        } else {
+            eprintln!("{}", msg.yellow());
+        }
+    }
+
+    fn status_error(&self, msg: &str) {
+        if let Some(b) = self.bridge {
+            b.status(msg, StatusLevel::Error);
+        } else {
+            eprintln!("{}", msg.red());
+        }
+    }
+
+    fn tool_result(&self, preview: &str, is_error: bool) {
+        if let Some(b) = self.bridge {
+            b.status(
+                &if is_error {
+                    format!("  Error: {preview}")
+                } else {
+                    format!("  {preview}")
+                },
+                if is_error {
+                    StatusLevel::Error
+                } else {
+                    StatusLevel::Dim
+                },
+            );
+        } else if is_error {
+            println!("{}", format!("  Error: {preview}").red());
+        } else {
+            println!("{}", format!("  {preview}").dimmed());
+        }
+    }
+
+    fn newline(&self) {
+        if self.bridge.is_none() {
+            println!();
+        }
+    }
+}
+
 /// Run the main query loop: send messages to the API, execute tool calls, repeat.
 pub async fn query_loop(
     client: &ApiClient,
@@ -41,53 +105,104 @@ pub async fn query_loop(
     cost_tracker: &mut CostTracker,
     tool_context: &ToolContext,
     escape_flag: &Arc<AtomicBool>,
+    system_prompt_override: Option<&str>,
+    bridge: Option<&UiBridge>,
 ) -> Result<()> {
-    let system_prompt = context::build_system_prompt(&config.cwd, &config.model);
+    let system_prompt = match system_prompt_override {
+        Some(prompt) => prompt.to_string(),
+        None => context::build_system_prompt(&config.cwd, &config.model),
+    };
     let tool_defs = tools.definitions();
+    let out = Output::new(bridge);
 
     let mut turns = 0;
     let mut max_tokens_recoveries: u32 = 0;
     let mut last_tool_names: Vec<String> = Vec::new();
-    // Track repeated tool calls to detect stuck loops
     let mut last_tool_signature: Option<String> = None;
     let mut repeated_tool_count: usize = 0;
-    // Track consecutive empty end_turn responses
     let mut empty_end_turn_count: u32 = 0;
-    // Model override when recovering from empty responses (fallback to heavy model)
     let mut empty_response_fallback_model: Option<String> = None;
 
     loop {
         // Check escape flag
         if escape_flag.load(Ordering::Relaxed) {
             escape_flag.store(false, Ordering::Relaxed);
-            println!();
-            eprintln!(
-                "{}",
-                format!("[interrupted by user at turn {turns}]").yellow()
-            );
+            out.newline();
+            out.status_warn(&format!("[interrupted by user at turn {turns}]"));
             break;
+        }
+
+        // Check for completed background tasks and inject notifications
+        {
+            let mut bg = tool_context.background_tasks.lock().await;
+            let completed = bg.drain_completed();
+            if !completed.is_empty() {
+                let mut notification_parts = Vec::new();
+                for task in &completed {
+                    let elapsed = match task.completed_at {
+                        Some(end) => end.duration_since(task.started_at).as_secs_f64(),
+                        None => task.started_at.elapsed().as_secs_f64(),
+                    };
+                    let status = task.status.as_str();
+                    let result = task.result.as_deref().unwrap_or("(no output)");
+                    notification_parts.push(format!(
+                        "<task_notification>\n\
+                         <task_id>{}</task_id>\n\
+                         <status>{status}</status>\n\
+                         <description>{}</description>\n\
+                         <duration>{elapsed:.1}s</duration>\n\
+                         <result>\n{result}\n</result>\n\
+                         </task_notification>",
+                        task.id, task.description
+                    ));
+
+                    if let Some(b) = bridge {
+                        b.send(crate::ui::events::UiEvent::BackgroundTaskCompleted {
+                            id: task.id.clone(),
+                            status: status.to_string(),
+                            duration_secs: elapsed,
+                        });
+                    } else {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "  [Background task #{} ({}) {} in {:.1}s]",
+                                task.id, task.description, status, elapsed
+                            )
+                            .cyan()
+                        );
+                    }
+                }
+                let notification_msg = notification_parts.join("\n\n");
+                messages.push(Message::user_text(&notification_msg));
+            }
         }
 
         // Auto-compaction check
         let estimated_tokens = compact::estimate_tokens(messages);
-        if estimated_tokens > AUTO_COMPACT_TOKEN_THRESHOLD && messages.len() > AUTO_COMPACT_KEEP_RECENT + 2 {
+        if estimated_tokens > AUTO_COMPACT_TOKEN_THRESHOLD
+            && messages.len() > AUTO_COMPACT_KEEP_RECENT + 2
+        {
             let before = messages.len();
-            *messages = compact::compact_messages(messages, AUTO_COMPACT_KEEP_RECENT);
+            out.status_dim("[auto-compacting conversation...]");
+            *messages = compact::compact_messages_ai(
+                client,
+                model_router::MODEL_LIGHT,
+                messages,
+                AUTO_COMPACT_KEEP_RECENT,
+            )
+            .await;
             if config.verbose {
-                eprintln!(
-                    "{}",
-                    format!(
-                        "[auto-compact: {} → {} messages, ~{} tokens]",
-                        before,
-                        messages.len(),
-                        compact::estimate_tokens(messages)
-                    )
-                    .dimmed()
-                );
+                out.status_dim(&format!(
+                    "[auto-compact: {} → {} messages, ~{} tokens]",
+                    before,
+                    messages.len(),
+                    compact::estimate_tokens(messages)
+                ));
             }
         }
 
-        // Adaptive model selection — override with fallback model if recovering from empty responses
+        // Adaptive model selection
         let model = match empty_response_fallback_model.take() {
             Some(fallback) => fallback,
             None => model_router::pick_model(
@@ -101,36 +216,52 @@ pub async fn query_loop(
         };
 
         if config.verbose {
-            eprintln!("{}", format!("[model: {model}]").dimmed());
+            out.status_dim(&format!("[model: {model}]"));
+        }
+
+        // Send model/turn info to UI
+        if let Some(b) = bridge {
+            b.model_info(&model);
+            b.turn_info(turns, config.max_turns);
         }
 
         // Retry loop for transient API errors
         let mut api_retries = 0u32;
         let (content_blocks, stop_reason, usage) = loop {
-            // Build API messages (rebuilt each retry in case compaction changed them)
             let api_messages = normalize_for_api(messages);
 
-            // Stream the response with thinking indicator
-            let thinking = std::sync::Mutex::new(Some(ThinkingIndicator::start()));
+            // Create streaming callbacks — bridge-based or print-based
+            let bridge_for_text = bridge.cloned();
+            let bridge_for_tool = bridge.cloned();
 
-            let mut on_text = |text: &str| {
-                if let Ok(mut guard) = thinking.lock() {
-                    if let Some(indicator) = guard.take() {
-                        indicator.stop();
-                    }
-                }
-                print!("{text}");
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
+            // ThinkingIndicator only used in non-bridge (oneshot) mode
+            let thinking = if bridge.is_none() {
+                std::sync::Mutex::new(Some(ThinkingIndicator::start()))
+            } else {
+                std::sync::Mutex::new(None)
             };
 
-            let mut on_tool_start = |_id: &str, name: &str| {
-                if let Ok(mut guard) = thinking.lock() {
-                    if let Some(indicator) = guard.take() {
-                        indicator.stop();
+            let mut on_text = move |text: &str| {
+                if let Some(ref b) = bridge_for_text {
+                    b.stream_text(text);
+                } else {
+                    if let Ok(mut guard) = thinking.lock() {
+                        if let Some(indicator) = guard.take() {
+                            indicator.stop();
+                        }
                     }
+                    print!("{text}");
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
                 }
-                println!("\n{} {}", "Tool:".cyan().bold(), name.cyan());
+            };
+
+            let mut on_tool_start = move |id: &str, name: &str| {
+                if let Some(ref b) = bridge_for_tool {
+                    b.stream_tool_start(id, name);
+                } else {
+                    println!("\n{} {}", "Tool:".cyan().bold(), name.cyan());
+                }
             };
 
             let result = client
@@ -146,22 +277,18 @@ pub async fn query_loop(
                 )
                 .await;
 
-            // Ensure thinking indicator is stopped after streaming completes
-            if let Ok(mut guard) = thinking.lock() {
-                if let Some(indicator) = guard.take() {
-                    indicator.stop();
-                }
-            }
-
             match result {
                 Ok(r) => break r,
                 Err(crate::api::errors::ApiError::ContextTooLong(_)) => {
-                    eprintln!(
-                        "{}",
-                        "[context too long, compacting...]".yellow()
-                    );
-                    *messages = compact::compact_messages(messages, 6);
-                    continue; // retry immediately after compaction
+                    out.status_warn("[context too long, compacting...]");
+                    *messages = compact::compact_messages_ai(
+                        client,
+                        model_router::MODEL_LIGHT,
+                        messages,
+                        6,
+                    )
+                    .await;
+                    continue;
                 }
                 Err(e) if e.is_retryable() && api_retries < MAX_API_RETRIES => {
                     api_retries += 1;
@@ -169,24 +296,18 @@ pub async fn query_loop(
                         crate::api::errors::ApiError::RateLimit {
                             retry_after_secs: Some(s),
                         } => *s,
-                        _ => 2u64.pow(api_retries), // exponential backoff
+                        _ => 2u64.pow(api_retries),
                     };
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "[transient API error: {e} — retrying in {delay}s ({api_retries}/{MAX_API_RETRIES})]"
-                        )
-                        .yellow()
-                    );
+                    out.status_warn(&format!(
+                        "[transient API error: {e} — retrying in {delay}s ({api_retries}/{MAX_API_RETRIES})]"
+                    ));
                     tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                     continue;
                 }
                 Err(e) => {
-                    eprintln!(
-                        "{}",
-                        format!("[query_loop exiting: API error after {api_retries} retries: {e}]")
-                            .red()
-                    );
+                    out.status_error(&format!(
+                        "[query_loop exiting: API error after {api_retries} retries: {e}]"
+                    ));
                     return Err(anyhow::anyhow!("API error: {e}"));
                 }
             }
@@ -194,14 +315,13 @@ pub async fn query_loop(
 
         cost_tracker.add_usage(&usage);
 
-        // Check if streaming was interrupted by ESC — break before processing tool calls
+        // Check if streaming was interrupted by ESC
         if escape_flag.load(Ordering::Relaxed) {
             escape_flag.store(false, Ordering::Relaxed);
-            println!();
-            eprintln!(
-                "{}",
-                format!("[interrupted by user during streaming at turn {turns}]").yellow()
-            );
+            out.newline();
+            out.status_warn(&format!(
+                "[interrupted by user during streaming at turn {turns}]"
+            ));
             break;
         }
 
@@ -213,9 +333,12 @@ pub async fn query_loop(
         };
         messages.push(Message::Assistant(assistant_msg));
 
-        // Check if the response has any actual content
-        let has_text = content_blocks.iter().any(|b| matches!(b, ContentBlock::Text { text } if !text.trim().is_empty()));
-        let has_tool_calls = content_blocks.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+        let has_text = content_blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if !text.trim().is_empty()));
+        let has_tool_calls = content_blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
 
         // Check if we're done
         if stop_reason == StopReason::EndTurn {
@@ -223,15 +346,10 @@ pub async fn query_loop(
                 empty_end_turn_count += 1;
 
                 if empty_end_turn_count == 1 {
-                    // Strategy 1: Inject a nudge message to prompt the model to continue
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "[warning: empty end_turn (attempt {}/{}), injecting nudge]",
-                            empty_end_turn_count, MAX_EMPTY_END_TURN
-                        )
-                        .yellow()
-                    );
+                    out.status_warn(&format!(
+                        "[warning: empty end_turn (attempt {}/{}), injecting nudge]",
+                        empty_end_turn_count, MAX_EMPTY_END_TURN
+                    ));
                     messages.push(Message::user_text(
                         "You returned an empty response. Please continue your analysis based on the tool results above. \
                          Summarize what you found and proceed with the next step.",
@@ -239,7 +357,6 @@ pub async fn query_loop(
                     turns += 1;
                     continue;
                 } else if empty_end_turn_count == 2 {
-                    // Strategy 2: Fall back to the heavy model (mini often causes empty responses)
                     let current_model = model_router::pick_model(
                         &config.model,
                         messages,
@@ -249,28 +366,20 @@ pub async fn query_loop(
                         config.intensity,
                     );
                     let fallback = if current_model == model_router::MODEL_HEAVY {
-                        None // already on heavy, just retry with nudge
+                        None
                     } else {
                         Some(model_router::MODEL_HEAVY.to_string())
                     };
                     if let Some(ref fb) = fallback {
-                        eprintln!(
-                            "{}",
-                            format!(
-                                "[warning: empty end_turn (attempt {}/{}), switching to '{}']",
-                                empty_end_turn_count, MAX_EMPTY_END_TURN, fb
-                            )
-                            .yellow()
-                        );
+                        out.status_warn(&format!(
+                            "[warning: empty end_turn (attempt {}/{}), switching to '{}']",
+                            empty_end_turn_count, MAX_EMPTY_END_TURN, fb
+                        ));
                     } else {
-                        eprintln!(
-                            "{}",
-                            format!(
-                                "[warning: empty end_turn (attempt {}/{}), retrying with nudge]",
-                                empty_end_turn_count, MAX_EMPTY_END_TURN
-                            )
-                            .yellow()
-                        );
+                        out.status_warn(&format!(
+                            "[warning: empty end_turn (attempt {}/{}), retrying with nudge]",
+                            empty_end_turn_count, MAX_EMPTY_END_TURN
+                        ));
                     }
                     empty_response_fallback_model = fallback;
                     messages.push(Message::user_text(
@@ -280,24 +389,18 @@ pub async fn query_loop(
                     turns += 1;
                     continue;
                 } else {
-                    // Exhausted all recovery strategies — give up
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "[loop exit: empty end_turn {} times at turn {turns}, recovery exhausted]",
-                            empty_end_turn_count
-                        )
-                        .dimmed()
-                    );
+                    out.status_dim(&format!(
+                        "[loop exit: empty end_turn {} times at turn {turns}, recovery exhausted]",
+                        empty_end_turn_count
+                    ));
                 }
             } else {
                 empty_end_turn_count = 0;
                 empty_response_fallback_model = None;
-                println!();
-                eprintln!(
-                    "{}",
-                    format!("[loop exit: model returned end_turn at turn {turns}]").dimmed()
-                );
+                out.newline();
+                out.status_dim(&format!(
+                    "[loop exit: model returned end_turn at turn {turns}]"
+                ));
             }
             break;
         }
@@ -307,16 +410,11 @@ pub async fn query_loop(
         if stop_reason == StopReason::MaxTokens {
             max_tokens_recoveries += 1;
             if max_tokens_recoveries <= MAX_OUTPUT_RECOVERY_ATTEMPTS {
-                // Inject a continuation prompt
                 if config.verbose {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "[max_tokens hit, recovery attempt {}/{}]",
-                            max_tokens_recoveries, MAX_OUTPUT_RECOVERY_ATTEMPTS
-                        )
-                        .dimmed()
-                    );
+                    out.status_dim(&format!(
+                        "[max_tokens hit, recovery attempt {}/{}]",
+                        max_tokens_recoveries, MAX_OUTPUT_RECOVERY_ATTEMPTS
+                    ));
                 }
                 messages.push(Message::user_text(
                     "Continue from where you left off. Do not repeat what you already said.",
@@ -324,14 +422,10 @@ pub async fn query_loop(
                 turns += 1;
                 continue;
             } else {
-                eprintln!(
-                    "{}",
-                    format!(
-                        "[loop exit: max_tokens hit {MAX_OUTPUT_RECOVERY_ATTEMPTS} times, unrecoverable at turn {turns}]"
-                    )
-                    .red()
-                );
-                println!("\n{}", "(max tokens reached, could not recover)".yellow());
+                out.status_error(&format!(
+                    "[loop exit: max_tokens hit {MAX_OUTPUT_RECOVERY_ATTEMPTS} times, unrecoverable at turn {turns}]"
+                ));
+                out.status_warn("(max tokens reached, could not recover)");
                 break;
             }
         }
@@ -352,7 +446,7 @@ pub async fn query_loop(
 
             last_tool_names = tool_uses.iter().map(|(_, n, _)| n.clone()).collect();
 
-            // Stuck-loop detection: hash current tool calls and compare to previous turn
+            // Stuck-loop detection
             let current_signature = {
                 let mut sig_parts: Vec<String> = tool_uses
                     .iter()
@@ -370,16 +464,32 @@ pub async fn query_loop(
             }
 
             if repeated_tool_count >= MAX_REPEATED_TOOL_CALLS {
-                eprintln!(
-                    "{}",
-                    format!(
-                        "[stuck-loop detected: same tool call repeated {} times, injecting warning]",
+                let tool_names: Vec<_> =
+                    tool_uses.iter().map(|(_, n, _)| n.as_str()).collect();
+
+                if repeated_tool_count >= MAX_REPEATED_TOOL_CALLS + 2 {
+                    out.status_error(&format!(
+                        "[stuck-loop: model ignored warnings, force-stopping after {} repeats]",
                         repeated_tool_count
-                    )
-                    .yellow()
-                );
-                // Don't execute the tools again — inject a warning instead
-                let tool_names: Vec<_> = tool_uses.iter().map(|(_, n, _)| n.as_str()).collect();
+                    ));
+                    let abort_msg = format!(
+                        "The AI got stuck calling {} repeatedly with the same arguments and could not recover. \
+                         Please try rephrasing your request.",
+                        tool_names.join(", ")
+                    );
+                    let results: Vec<_> = tool_uses
+                        .iter()
+                        .map(|(id, _, _)| (id.clone(), abort_msg.clone(), true))
+                        .collect();
+                    messages.push(Message::tool_results(results));
+                    out.status_warn(&abort_msg);
+                    break;
+                }
+
+                out.status_warn(&format!(
+                    "[stuck-loop detected: same tool call repeated {} times, injecting warning]",
+                    repeated_tool_count
+                ));
                 let warning = format!(
                     "STOP: You have called the exact same tool(s) ({}) with the exact same arguments {} times in a row, getting the same result each time. \
                      This is a stuck loop. You MUST try a completely different approach. \
@@ -390,7 +500,6 @@ pub async fn query_loop(
                     tool_names.join(", "),
                     repeated_tool_count
                 );
-                // Add dummy tool results so the conversation stays valid
                 let results: Vec<_> = tool_uses
                     .iter()
                     .map(|(id, _, _)| (id.clone(), warning.clone(), true))
@@ -406,12 +515,10 @@ pub async fn query_loop(
                 // Check escape between tool calls
                 if escape_flag.load(Ordering::Relaxed) {
                     escape_flag.store(false, Ordering::Relaxed);
-                    println!();
-                    eprintln!(
-                        "{}",
-                        format!("[interrupted by user during tool execution at turn {turns}]").yellow()
-                    );
-                    // Return partial results so conversation stays valid
+                    out.newline();
+                    out.status_warn(&format!(
+                        "[interrupted by user during tool execution at turn {turns}]"
+                    ));
                     results.push((id.clone(), "Interrupted by user".to_string(), true));
                     break;
                 }
@@ -426,18 +533,14 @@ pub async fn query_loop(
 
                 // Validate required parameters before executing
                 if let Some(validation_error) = validate_tool_input(tool, input) {
-                    eprintln!(
-                        "{}",
-                        format!("[tool '{name}' input validation failed: {validation_error}]")
-                            .yellow()
-                    );
+                    out.status_warn(&format!(
+                        "[tool '{name}' input validation failed: {validation_error}]"
+                    ));
                     results.push((id.clone(), validation_error, true));
                     continue;
                 }
 
                 let is_read_only = tool.is_read_only(input);
-
-                // Read permission mode from shared state
                 let current_mode = *tool_context.permission_mode.lock().await;
 
                 // Check permissions
@@ -454,14 +557,32 @@ pub async fn query_loop(
                 let allowed = match perm {
                     permissions::PermissionResult::Allow => true,
                     permissions::PermissionResult::Deny(reason) => {
-                        results.push((id.clone(), format!("Permission denied: {reason}"), true));
+                        results
+                            .push((id.clone(), format!("Permission denied: {reason}"), true));
                         continue;
                     }
                     permissions::PermissionResult::Ask => {
-                        let description = input["description"].as_str();
-                        match permissions::prompt_user_permission(name, input, description) {
-                            Ok(true) => true,
-                            Ok(false) => {
+                        // Route permission prompt through bridge if available
+                        if let Some(b) = bridge {
+                            let desc = input["description"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string();
+                            let tool_desc = format!(
+                                "{name}: {}",
+                                serde_json::to_string(input)
+                                    .unwrap_or_default()
+                                    .chars()
+                                    .take(200)
+                                    .collect::<String>()
+                            );
+                            // block_in_place so tokio background tasks keep running
+                            let allowed_by_user = tokio::task::block_in_place(|| {
+                                b.prompt_permission(&tool_desc, &desc)
+                            });
+                            if allowed_by_user {
+                                true
+                            } else {
                                 results.push((
                                     id.clone(),
                                     "User denied permission".to_string(),
@@ -469,13 +590,31 @@ pub async fn query_loop(
                                 ));
                                 continue;
                             }
-                            Err(e) => {
-                                results.push((
-                                    id.clone(),
-                                    format!("Permission prompt error: {e}"),
-                                    true,
-                                ));
-                                continue;
+                        } else {
+                            // Direct stdin permission prompt (oneshot mode)
+                            let description = input["description"].as_str();
+                            match permissions::prompt_user_permission(
+                                name,
+                                input,
+                                description,
+                            ) {
+                                Ok(true) => true,
+                                Ok(false) => {
+                                    results.push((
+                                        id.clone(),
+                                        "User denied permission".to_string(),
+                                        true,
+                                    ));
+                                    continue;
+                                }
+                                Err(e) => {
+                                    results.push((
+                                        id.clone(),
+                                        format!("Permission prompt error: {e}"),
+                                        true,
+                                    ));
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -483,12 +622,31 @@ pub async fn query_loop(
 
                 if allowed {
                     if config.verbose {
-                        let input_str = serde_json::to_string_pretty(input).unwrap_or_default();
-                        println!("{}", input_str.dimmed());
+                        let input_str =
+                            serde_json::to_string_pretty(input).unwrap_or_default();
+                        out.status_dim(&input_str);
                     }
+
+                    // Run PreToolUse hooks
+                    if let Some(block_reason) = crate::hooks::run_pre_tool_hooks(
+                        &config.hooks, name, input, &tool_context.cwd,
+                    ).await {
+                        out.status_warn(&format!("[hook blocked {name}: {block_reason}]"));
+                        results.push((id.clone(), format!("Blocked by hook: {block_reason}"), true));
+                        continue;
+                    }
+
+                    // Notify UI of tool execution start
+                    if let Some(b) = bridge {
+                        b.tool_exec_start(name);
+                    }
+
+                    let tool_start = std::time::Instant::now();
 
                     match tool.call(input.clone(), tool_context).await {
                         Ok(mut result) => {
+                            let duration_ms = tool_start.elapsed().as_millis() as u64;
+
                             // Truncate large tool results
                             if result.content.len() > MAX_TOOL_RESULT_CHARS {
                                 let truncated =
@@ -503,26 +661,56 @@ pub async fn query_loop(
                                 );
                             }
 
-                            let preview: String =
-                                result.content.chars().take(500).collect();
-                            if result.is_error {
-                                println!("{}", format!("  Error: {preview}").red());
-                            } else {
-                                println!("{}", format!("  {preview}").dimmed());
-                            }
-                            if result.content.len() > 500 {
-                                println!(
-                                    "{}",
-                                    format!("  ... ({} total chars)", result.content.len())
-                                        .dimmed()
+                            // Show first line only as preview (multi-line results look broken in terminal)
+                            let preview: String = result
+                                .content
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                                .chars()
+                                .take(500)
+                                .collect();
+
+                            if let Some(b) = bridge {
+                                b.tool_result(
+                                    name,
+                                    &preview,
+                                    result.is_error,
+                                    duration_ms,
                                 );
+                            } else {
+                                out.tool_result(&preview, result.is_error);
+                                if result.content.len() > 500 {
+                                    out.status_dim(&format!(
+                                        "  ... ({} total chars)",
+                                        result.content.len()
+                                    ));
+                                }
                             }
 
-                            results.push((id.clone(), result.content, result.is_error));
+                            // Run PostToolUse hooks
+                            let hook_context = crate::hooks::run_post_tool_hooks(
+                                &config.hooks, name, input, &result.content, &tool_context.cwd,
+                            ).await;
+                            if !hook_context.is_empty() {
+                                result.content.push_str(&format!(
+                                    "\n\n--- Hook Output ---\n{hook_context}"
+                                ));
+                            }
+
+                            results
+                                .push((id.clone(), result.content, result.is_error));
                         }
                         Err(e) => {
+                            let duration_ms = tool_start.elapsed().as_millis() as u64;
                             let error_msg = format!("Tool execution error: {e}");
-                            println!("{}", format!("  {error_msg}").red());
+
+                            if let Some(b) = bridge {
+                                b.tool_result(name, &error_msg, true, duration_ms);
+                            } else {
+                                out.tool_result(&error_msg, true);
+                            }
+
                             results.push((id.clone(), error_msg, true));
                         }
                     }
@@ -539,14 +727,11 @@ pub async fn query_loop(
 
         turns += 1;
         if turns >= config.max_turns {
-            eprintln!(
-                "{}",
-                format!("[loop exit: max turns limit ({}) reached]", config.max_turns).red()
-            );
-            println!(
-                "\n{}",
-                format!("Max turns ({}) reached.", config.max_turns).yellow()
-            );
+            out.status_error(&format!(
+                "[loop exit: max turns limit ({}) reached]",
+                config.max_turns
+            ));
+            out.status_warn(&format!("Max turns ({}) reached.", config.max_turns));
             break;
         }
 
@@ -554,15 +739,10 @@ pub async fn query_loop(
         if let Some(budget) = config.budget_usd {
             let current_cost = cost_tracker.estimate_cost_usd(&config.model);
             if current_cost >= budget {
-                eprintln!(
-                    "{}",
-                    format!("[loop exit: budget ${budget:.2} exhausted (spent ${current_cost:.2})]")
-                        .red()
-                );
-                println!(
-                    "\n{}",
-                    format!("Budget limit (${budget:.2}) reached.").yellow()
-                );
+                out.status_error(&format!(
+                    "[loop exit: budget ${budget:.2} exhausted (spent ${current_cost:.2})]"
+                ));
+                out.status_warn(&format!("Budget limit (${budget:.2}) reached."));
                 break;
             }
         }
@@ -573,7 +753,10 @@ pub async fn query_loop(
 
 /// Validate tool input against the tool's JSON schema.
 /// Returns Some(error_message) if validation fails, None if OK.
-fn validate_tool_input(tool: &dyn crate::tools::Tool, input: &serde_json::Value) -> Option<String> {
+fn validate_tool_input(
+    tool: &dyn crate::tools::Tool,
+    input: &serde_json::Value,
+) -> Option<String> {
     let schema = tool.input_schema();
 
     // Check required fields
@@ -600,8 +783,14 @@ fn validate_tool_input(tool: &dyn crate::tools::Tool, input: &serde_json::Value)
                         .iter()
                         .filter_map(|name| {
                             props.get(*name).and_then(|p| {
-                                let typ = p.get("type").and_then(|t| t.as_str()).unwrap_or("any");
-                                let desc = p.get("description").and_then(|d| d.as_str()).unwrap_or("");
+                                let typ = p
+                                    .get("type")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("any");
+                                let desc = p
+                                    .get("description")
+                                    .and_then(|d| d.as_str())
+                                    .unwrap_or("");
                                 Some(format!("  - {name} ({typ}): {desc}"))
                             })
                         })
@@ -610,10 +799,19 @@ fn validate_tool_input(tool: &dyn crate::tools::Tool, input: &serde_json::Value)
                 })
                 .unwrap_or_default();
 
+            let is_completely_empty =
+                input.as_object().map_or(true, |o| o.is_empty());
+            let extra_hint = if is_completely_empty {
+                "\n\nYour tool call had NO arguments at all. This usually means something went wrong. \
+                 Do NOT retry with empty arguments — either provide the correct parameters or try a different approach."
+            } else {
+                ""
+            };
             return Some(format!(
-                "Missing required parameter(s): {}. You MUST provide these parameters.\n{}",
+                "Missing required parameter(s): {}. You MUST provide these parameters.\n{}{}",
                 missing.join(", "),
-                schema_hint
+                schema_hint,
+                extra_hint
             ));
         }
     }
@@ -625,7 +823,9 @@ fn validate_tool_input(tool: &dyn crate::tools::Tool, input: &serde_json::Value)
     ) {
         for (key, value) in input_obj {
             if let Some(prop_schema) = properties.get(key) {
-                if let Some(expected_type) = prop_schema.get("type").and_then(|t| t.as_str()) {
+                if let Some(expected_type) =
+                    prop_schema.get("type").and_then(|t| t.as_str())
+                {
                     let type_ok = match expected_type {
                         "string" => value.is_string(),
                         "number" | "integer" => value.is_number(),
