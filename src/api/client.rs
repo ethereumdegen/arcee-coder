@@ -3,6 +3,8 @@ use crate::api::retry::{with_retry, RetryConfig};
 use crate::api::streaming::{SseStream, StreamAccumulator};
 use crate::api::types::*;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio_stream::StreamExt;
 
 pub struct ApiClient {
@@ -40,6 +42,33 @@ impl ApiClient {
             })?,
         );
         Ok(headers)
+    }
+
+    /// Fetch the list of available models (and their pricing) from the API.
+    pub async fn fetch_models(&self) -> Result<Vec<ModelInfo>, ApiError> {
+        let url = format!("{}/api/v1/models", self.base_url);
+        let headers = self.headers()?;
+
+        let response = self
+            .http
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ApiError::Server(format!(
+                "Failed to fetch models (HTTP {status}): {body}"
+            )));
+        }
+
+        let body: ModelsListResponse = response.json().await.map_err(|e| {
+            ApiError::Server(format!("Failed to parse models response: {e}"))
+        })?;
+
+        Ok(body.data)
     }
 
     /// Send a streaming chat completion request, returning the raw SSE stream.
@@ -116,6 +145,7 @@ impl ApiClient {
         max_tokens: u32,
         on_text: &mut (dyn FnMut(&str) + Send),
         on_tool_use_start: &mut (dyn FnMut(&str, &str) + Send),
+        escape_flag: Option<&Arc<AtomicBool>>,
     ) -> Result<(Vec<ContentBlock>, StopReason, Usage), ApiError> {
         self.send_message_with_model(
             &self.model,
@@ -125,6 +155,7 @@ impl ApiClient {
             max_tokens,
             on_text,
             on_tool_use_start,
+            escape_flag,
         )
         .await
     }
@@ -139,6 +170,7 @@ impl ApiClient {
         max_tokens: u32,
         on_text: &mut (dyn FnMut(&str) + Send),
         on_tool_use_start: &mut (dyn FnMut(&str, &str) + Send),
+        escape_flag: Option<&Arc<AtomicBool>>,
     ) -> Result<(Vec<ContentBlock>, StopReason, Usage), ApiError> {
         let retry_config = RetryConfig::default();
 
@@ -192,6 +224,14 @@ impl ApiClient {
             std::collections::HashSet::new();
 
         while let Some(chunk_result) = stream.next().await {
+            // Check escape flag during streaming — break immediately so the
+            // stream is dropped (cancelling the HTTP connection, like AbortController.abort())
+            if let Some(flag) = escape_flag {
+                if flag.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+
             let chunk = chunk_result?;
 
             // Emit streaming callbacks before accumulating

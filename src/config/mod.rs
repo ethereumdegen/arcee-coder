@@ -1,5 +1,7 @@
 pub mod paths;
 
+use crate::engine::cost::PricingTable;
+use crate::engine::model_router::Intensity;
 use crate::permissions::{PermissionMode, PermissionStrictness};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -49,6 +51,14 @@ pub struct Config {
     /// Automatically switch between trinity-mini and trinity-large-thinking.
     #[serde(default = "default_auto_routing")]
     pub auto_model_routing: bool,
+
+    /// Routing intensity: high (always big model), medium (balanced), low (prefer cheap).
+    #[serde(default)]
+    pub intensity: Intensity,
+
+    /// Dynamic pricing table fetched from the API on boot.
+    #[serde(skip)]
+    pub pricing_table: PricingTable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +104,8 @@ impl Default for Config {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             verbose: false,
             auto_model_routing: default_auto_routing(),
+            intensity: Intensity::default(),
+            pricing_table: PricingTable::new(),
         }
     }
 }
@@ -117,6 +129,7 @@ impl Config {
                     config.allow_rules = file_config.allow_rules;
                     config.deny_rules = file_config.deny_rules;
                     config.auto_model_routing = file_config.auto_model_routing;
+                    config.intensity = file_config.intensity;
                 }
                 Err(e) => {
                     eprintln!(

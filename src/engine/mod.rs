@@ -14,6 +14,8 @@ use crate::ui::thinking::ThinkingIndicator;
 use anyhow::Result;
 use colored::Colorize;
 use cost::CostTracker;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Maximum characters in a single tool result before truncation.
 const MAX_TOOL_RESULT_CHARS: usize = 50_000;
@@ -25,6 +27,8 @@ const AUTO_COMPACT_KEEP_RECENT: usize = 10;
 const MAX_OUTPUT_RECOVERY_ATTEMPTS: u32 = 3;
 /// Max retries for transient API errors (rate-limit, server errors, network).
 const MAX_API_RETRIES: u32 = 3;
+/// Max consecutive empty end_turn responses before giving up.
+const MAX_EMPTY_END_TURN: u32 = 3;
 /// Max times the same tool call can repeat before we inject a stuck-loop warning.
 const MAX_REPEATED_TOOL_CALLS: usize = 3;
 
@@ -36,6 +40,7 @@ pub async fn query_loop(
     config: &Config,
     cost_tracker: &mut CostTracker,
     tool_context: &ToolContext,
+    escape_flag: &Arc<AtomicBool>,
 ) -> Result<()> {
     let system_prompt = context::build_system_prompt(&config.cwd, &config.model);
     let tool_defs = tools.definitions();
@@ -43,11 +48,26 @@ pub async fn query_loop(
     let mut turns = 0;
     let mut max_tokens_recoveries: u32 = 0;
     let mut last_tool_names: Vec<String> = Vec::new();
-    // Track repeated tool calls: (tool_name, input_hash) -> consecutive count
+    // Track repeated tool calls to detect stuck loops
     let mut last_tool_signature: Option<String> = None;
     let mut repeated_tool_count: usize = 0;
+    // Track consecutive empty end_turn responses
+    let mut empty_end_turn_count: u32 = 0;
+    // Model override when recovering from empty responses (fallback to heavy model)
+    let mut empty_response_fallback_model: Option<String> = None;
 
     loop {
+        // Check escape flag
+        if escape_flag.load(Ordering::Relaxed) {
+            escape_flag.store(false, Ordering::Relaxed);
+            println!();
+            eprintln!(
+                "{}",
+                format!("[interrupted by user at turn {turns}]").yellow()
+            );
+            break;
+        }
+
         // Auto-compaction check
         let estimated_tokens = compact::estimate_tokens(messages);
         if estimated_tokens > AUTO_COMPACT_TOKEN_THRESHOLD && messages.len() > AUTO_COMPACT_KEEP_RECENT + 2 {
@@ -67,14 +87,18 @@ pub async fn query_loop(
             }
         }
 
-        // Adaptive model selection
-        let model = model_router::pick_model(
-            &config.model,
-            messages,
-            &last_tool_names,
-            turns,
-            config.auto_model_routing,
-        );
+        // Adaptive model selection — override with fallback model if recovering from empty responses
+        let model = match empty_response_fallback_model.take() {
+            Some(fallback) => fallback,
+            None => model_router::pick_model(
+                &config.model,
+                messages,
+                &last_tool_names,
+                turns,
+                config.auto_model_routing,
+                config.intensity,
+            ),
+        };
 
         if config.verbose {
             eprintln!("{}", format!("[model: {model}]").dimmed());
@@ -118,6 +142,7 @@ pub async fn query_loop(
                     config.max_tokens,
                     &mut on_text,
                     &mut on_tool_start,
+                    Some(escape_flag),
                 )
                 .await;
 
@@ -169,6 +194,17 @@ pub async fn query_loop(
 
         cost_tracker.add_usage(&usage);
 
+        // Check if streaming was interrupted by ESC — break before processing tool calls
+        if escape_flag.load(Ordering::Relaxed) {
+            escape_flag.store(false, Ordering::Relaxed);
+            println!();
+            eprintln!(
+                "{}",
+                format!("[interrupted by user during streaming at turn {turns}]").yellow()
+            );
+            break;
+        }
+
         // Store assistant message
         let assistant_msg = AssistantMessage {
             content: content_blocks.clone(),
@@ -184,24 +220,89 @@ pub async fn query_loop(
         // Check if we're done
         if stop_reason == StopReason::EndTurn {
             if !has_text && !has_tool_calls && turns > 0 {
-                // Empty response mid-conversation — likely a stream issue, not a real end
+                empty_end_turn_count += 1;
+
+                if empty_end_turn_count == 1 {
+                    // Strategy 1: Inject a nudge message to prompt the model to continue
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "[warning: empty end_turn (attempt {}/{}), injecting nudge]",
+                            empty_end_turn_count, MAX_EMPTY_END_TURN
+                        )
+                        .yellow()
+                    );
+                    messages.push(Message::user_text(
+                        "You returned an empty response. Please continue your analysis based on the tool results above. \
+                         Summarize what you found and proceed with the next step.",
+                    ));
+                    turns += 1;
+                    continue;
+                } else if empty_end_turn_count == 2 {
+                    // Strategy 2: Fall back to the heavy model (mini often causes empty responses)
+                    let current_model = model_router::pick_model(
+                        &config.model,
+                        messages,
+                        &last_tool_names,
+                        turns,
+                        config.auto_model_routing,
+                        config.intensity,
+                    );
+                    let fallback = if current_model == model_router::MODEL_HEAVY {
+                        None // already on heavy, just retry with nudge
+                    } else {
+                        Some(model_router::MODEL_HEAVY.to_string())
+                    };
+                    if let Some(ref fb) = fallback {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "[warning: empty end_turn (attempt {}/{}), switching to '{}']",
+                                empty_end_turn_count, MAX_EMPTY_END_TURN, fb
+                            )
+                            .yellow()
+                        );
+                    } else {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "[warning: empty end_turn (attempt {}/{}), retrying with nudge]",
+                                empty_end_turn_count, MAX_EMPTY_END_TURN
+                            )
+                            .yellow()
+                        );
+                    }
+                    empty_response_fallback_model = fallback;
+                    messages.push(Message::user_text(
+                        "You returned an empty response again. Please respond to the user's request. \
+                         Analyze the conversation and tool results and provide your answer.",
+                    ));
+                    turns += 1;
+                    continue;
+                } else {
+                    // Exhausted all recovery strategies — give up
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "[loop exit: empty end_turn {} times at turn {turns}, recovery exhausted]",
+                            empty_end_turn_count
+                        )
+                        .dimmed()
+                    );
+                }
+            } else {
+                empty_end_turn_count = 0;
+                empty_response_fallback_model = None;
+                println!();
                 eprintln!(
                     "{}",
-                    "[warning: model returned empty end_turn, injecting continuation]".yellow()
+                    format!("[loop exit: model returned end_turn at turn {turns}]").dimmed()
                 );
-                messages.push(Message::user_text(
-                    "It seems your response was cut off or empty. Please continue with the task.",
-                ));
-                turns += 1;
-                continue;
             }
-            println!();
-            eprintln!(
-                "{}",
-                format!("[loop exit: model returned end_turn at turn {turns}]").dimmed()
-            );
             break;
         }
+        empty_end_turn_count = 0;
+        empty_response_fallback_model = None;
 
         if stop_reason == StopReason::MaxTokens {
             max_tokens_recoveries += 1;
@@ -302,6 +403,19 @@ pub async fn query_loop(
             let mut results = Vec::new();
 
             for (id, name, input) in &tool_uses {
+                // Check escape between tool calls
+                if escape_flag.load(Ordering::Relaxed) {
+                    escape_flag.store(false, Ordering::Relaxed);
+                    println!();
+                    eprintln!(
+                        "{}",
+                        format!("[interrupted by user during tool execution at turn {turns}]").yellow()
+                    );
+                    // Return partial results so conversation stays valid
+                    results.push((id.clone(), "Interrupted by user".to_string(), true));
+                    break;
+                }
+
                 let tool = match tools.get(name) {
                     Some(t) => t,
                     None => {

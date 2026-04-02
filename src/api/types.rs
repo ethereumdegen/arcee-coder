@@ -196,6 +196,30 @@ pub struct UsageResponse {
     pub total_tokens: u64,
 }
 
+// ── Models List Types (for fetching pricing from API) ──
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelsListResponse {
+    pub data: Vec<ModelInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    #[serde(default)]
+    pub pricing: Option<ModelPricing>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelPricing {
+    pub prompt: Option<String>,
+    pub completion: Option<String>,
+    #[serde(default)]
+    pub input_cache_reads: Option<String>,
+    #[serde(default)]
+    pub input_cache_writes: Option<String>,
+}
+
 // ── Internal Types (used throughout the app) ──
 
 /// Unified content block used internally.

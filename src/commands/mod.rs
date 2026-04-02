@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::engine::cost::CostTracker;
+use crate::engine::model_router::Intensity;
 use crate::messages::types::Message;
 use crate::permissions::PermissionStrictness;
 use colored::Colorize;
@@ -107,6 +108,46 @@ pub fn handle_command(
             }
             true
         }
+        "/intensity" => {
+            if args.is_empty() {
+                let current = config.intensity;
+                println!("Current intensity: {}", current.as_str().green());
+                println!();
+                for level in &[Intensity::High, Intensity::Medium, Intensity::Low] {
+                    let marker = if *level == current { " <--" } else { "" };
+                    println!(
+                        "  {} — {}{}",
+                        level.as_str().cyan(),
+                        level.description(),
+                        marker.green()
+                    );
+                }
+                println!();
+                println!("Usage: /intensity <high|medium|low>");
+            } else {
+                match Intensity::from_str(args.trim()) {
+                    Some(new_intensity) => {
+                        config.intensity = new_intensity;
+                        println!(
+                            "{}",
+                            format!(
+                                "Intensity set to: {} — {}",
+                                new_intensity.as_str(),
+                                new_intensity.description()
+                            )
+                            .green()
+                        );
+                    }
+                    None => {
+                        println!(
+                            "{}",
+                            format!("Unknown intensity: {args}. Use high, medium, or low.").yellow()
+                        );
+                    }
+                }
+            }
+            true
+        }
         "/tokens" => {
             let estimated = crate::engine::compact::estimate_tokens(messages);
             println!(
@@ -143,6 +184,7 @@ Available commands:
   /compact   Compress conversation context
   /cost      Show token usage and estimated cost
   /model     Show or switch model (trinity-mini, trinity-large-thinking)
+  /intensity Set model routing intensity (high, medium, low)
   /strictness  Show or set permission strictness (high, medium, low)
   /tokens    Show estimated token count
   /history   Show conversation summary

@@ -1,6 +1,15 @@
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Global flag: when true, the escape listener must pause and not touch stdin.
+static PROMPT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Returns true if a permission prompt is currently waiting for input.
+pub fn is_prompt_active() -> bool {
+    PROMPT_ACTIVE.load(Ordering::SeqCst)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -301,33 +310,47 @@ pub fn prompt_user_permission(
     );
 
     if !input_summary.is_empty() {
-        println!("  {}", input_summary.dimmed());
+        // Show Write/Edit content previews without dimming so diffs are readable
+        if tool_name == "Write" || tool_name == "Edit" {
+            println!("  {}", input_summary);
+        } else {
+            println!("  {}", input_summary.dimmed());
+        }
     }
 
     print!("{} ", "[y/N]".yellow());
     io::stdout().flush()?;
 
+    // Signal the escape listener to stop touching stdin while we read.
+    PROMPT_ACTIVE.store(true, Ordering::SeqCst);
+    // Small delay to let the escape listener finish any in-flight poll cycle.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
     let mut response = String::new();
-    match io::stdin().read_line(&mut response) {
+    let result = match io::stdin().read_line(&mut response) {
         Ok(0) => {
             eprintln!(
                 "{}",
                 "[permission prompt: stdin returned EOF, denying]".yellow()
             );
-            return Ok(false);
+            Ok(false)
         }
-        Ok(_) => {}
+        Ok(_) => Ok(response.trim().eq_ignore_ascii_case("y")),
         Err(e) => {
             eprintln!(
                 "{}",
                 format!("[permission prompt: stdin read error: {e}, denying]").yellow()
             );
-            return Ok(false);
+            Ok(false)
         }
-    }
+    };
 
-    Ok(response.trim().eq_ignore_ascii_case("y"))
+    PROMPT_ACTIVE.store(false, Ordering::SeqCst);
+    result
 }
+
+/// Max lines to show in a content preview before truncating.
+const PREVIEW_MAX_LINES: usize = 80;
 
 fn summarize_input(tool_name: &str, input: &serde_json::Value) -> String {
     match tool_name {
@@ -339,15 +362,53 @@ fn summarize_input(tool_name: &str, input: &serde_json::Value) -> String {
             .as_str()
             .unwrap_or("")
             .to_string(),
-        "Write" => format!(
-            "{} ({} bytes)",
-            input["file_path"].as_str().unwrap_or(""),
-            input["content"].as_str().map_or(0, |s| s.len())
-        ),
-        "Edit" => input["file_path"]
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
+        "Write" => {
+            let path = input["file_path"].as_str().unwrap_or("");
+            let content = input["content"].as_str().unwrap_or("");
+            let is_new = !std::path::Path::new(path).exists();
+            let action = if is_new { "Create" } else { "Overwrite" };
+            let line_count = content.lines().count();
+            let mut out = format!(
+                "{action} {path} ({line_count} lines, {} bytes)\n",
+                content.len()
+            );
+
+            let lines: Vec<&str> = content.lines().collect();
+            let show = lines.len().min(PREVIEW_MAX_LINES);
+            for (i, line) in lines[..show].iter().enumerate() {
+                let prefix = if is_new {
+                    format!("{}", "+".green())
+                } else {
+                    " ".to_string()
+                };
+                out.push_str(&format!("\n  {prefix} {:>4} | {line}", i + 1));
+            }
+            if lines.len() > PREVIEW_MAX_LINES {
+                out.push_str(&format!(
+                    "\n  ... ({} more lines)",
+                    lines.len() - PREVIEW_MAX_LINES
+                ));
+            }
+            out
+        }
+        "Edit" => {
+            let path = input["file_path"].as_str().unwrap_or("");
+            let old = input["old_string"].as_str().unwrap_or("");
+            let new = input["new_string"].as_str().unwrap_or("");
+            let replace_all = input["replace_all"].as_bool().unwrap_or(false);
+            let mut out = path.to_string();
+            if replace_all {
+                out.push_str(" (replace all)");
+            }
+            out.push('\n');
+            for line in old.lines() {
+                out.push_str(&format!("\n  {} | {line}", "-".red()));
+            }
+            for line in new.lines() {
+                out.push_str(&format!("\n  {} | {line}", "+".green()));
+            }
+            out
+        }
         "Glob" => input["pattern"]
             .as_str()
             .unwrap_or("")

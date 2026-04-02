@@ -6,6 +6,7 @@ use crate::tools::{Tool, ToolContext, ToolRegistry, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -61,7 +62,7 @@ impl Tool for AgentTool {
 
         let registry = build_subagent_registry(agent_type);
         let mut messages = vec![Message::user_text(prompt)];
-        let mut cost_tracker = CostTracker::new();
+        let mut cost_tracker = CostTracker::with_pricing(context.config.pricing_table.clone());
 
         // Create a sub-config with limited turns
         let mut sub_config = context.config.clone();
@@ -83,6 +84,8 @@ impl Tool for AgentTool {
 
         println!("\n  [Agent ({agent_type}): starting sub-agent]");
 
+        // Sub-agents get their own escape flag (not interruptible by parent ESC)
+        let sub_escape = Arc::new(AtomicBool::new(false));
         let result = engine::query_loop(
             &context.api_client,
             &mut messages,
@@ -90,6 +93,7 @@ impl Tool for AgentTool {
             &sub_config,
             &mut cost_tracker,
             &child_context,
+            &sub_escape,
         )
         .await;
 

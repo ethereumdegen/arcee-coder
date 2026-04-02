@@ -1,8 +1,8 @@
 ---
 name: config-management
-tags: [config, settings]
+tags: [config, settings, defaults]
 skills: [json-api]
-expected: Properly loads and applies configuration settings
+expected: Properly loads and applies configuration settings from all sources
 ---
 
 Test the configuration system and its various sources.
@@ -14,3 +14,7 @@ The system should:
 - Handle missing or malformed config files gracefully
 - Persist user preferences across sessions
 - Validate configuration values and provide helpful errors
+- Support environment variable overrides
+- Handle configuration reloads without restarting
+- Merge configurations from multiple sources correctly (defaults < config < flags)
+- Support configuration templates for common setups
