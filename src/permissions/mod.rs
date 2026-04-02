@@ -117,6 +117,9 @@ fn classify_single_command(cmd: &str) -> DangerLevel {
         return DangerLevel::Safe;
     }
 
+    let cmd_lower = cmd.to_lowercase();
+    let first_word = cmd.split_whitespace().next().unwrap_or("");
+
     // Check destructive patterns first
     let destructive_patterns: &[&str] = &[
         "rm -rf",
@@ -130,87 +133,58 @@ fn classify_single_command(cmd: &str) -> DangerLevel {
         "dd if=",
         "mkfs",
         "truncate",
-        "format ",
         "fdisk",
         ":(){ :|:& };:",
     ];
 
-    let cmd_lower = cmd.to_lowercase();
     for pattern in destructive_patterns {
         if cmd_lower.contains(pattern) {
             return DangerLevel::Destructive;
         }
     }
 
-    // Check safe commands
-    let safe_commands: &[&str] = &[
-        "ls", "cat", "head", "tail", "echo", "pwd", "whoami", "date", "wc", "sort", "uniq",
-        "diff", "find", "grep", "rg", "which", "type", "file", "stat", "du", "df", "env",
-        "printenv", "uname", "hostname", "tree", "less", "more",
+    // Check moderate: explicit dangerous commands/flags that should always prompt
+    let moderate_first_words: &[&str] = &[
+        "rm", "rmdir", "mv", "chmod", "chown", "chgrp", "kill", "pkill", "killall",
+        "sudo", "su", "wget", "reboot", "shutdown", "systemctl",
     ];
 
-    let first_word = cmd.split_whitespace().next().unwrap_or("");
-
-    for safe in safe_commands {
-        if first_word == *safe {
-            return DangerLevel::Safe;
-        }
+    if moderate_first_words.contains(&first_word) {
+        return DangerLevel::Moderate;
     }
 
-    // Check safe prefixes
-    let safe_prefixes: &[&str] = &[
-        "git log",
-        "git status",
-        "git diff",
-        "git show",
-        "git branch",
-        "git remote",
-        "git add",
-        "git stash",
-        "git tag",
-        "git fetch",
-        "git commit",
-        "git push",
-        "cargo build",
-        "cargo test",
-        "cargo check",
-        "cargo clippy",
-        "cargo fmt",
-        "cargo run",
-        "npm test",
-        "npm run",
-        "python -c",
-        "rustc --version",
-        "node --version",
-        "cd ",
+    let moderate_patterns: &[&str] = &[
+        "git reset",
+        "git checkout --",
+        "git restore .",
+        "curl | sh",
+        "curl | bash",
+        "pip install",
+        "apt install",
+        "apt remove",
+        "apt purge",
+        "brew install",
+        "brew uninstall",
     ];
 
-    for prefix in safe_prefixes {
-        if cmd.starts_with(prefix) || cmd == prefix.trim() {
-            return DangerLevel::Safe;
-        }
-    }
-
-    // Check moderate patterns
-    let moderate_indicators: &[&str] = &[
-        "rm", "mv", "chmod", "chown", "kill", "pkill", "sudo", "git reset",
-        "git checkout --", "git restore .", "curl | sh", "wget", "npm install", "pip install",
-        "apt", "brew install",
-    ];
-
-    for indicator in moderate_indicators {
-        if cmd_lower.starts_with(indicator) || cmd_lower.contains(indicator) {
+    for pattern in moderate_patterns {
+        if cmd_lower.starts_with(pattern) {
             return DangerLevel::Moderate;
         }
     }
 
-    // Check for redirects
-    if cmd.contains('>') || cmd.contains(">>") {
+    // Any command with --force or -f flag is at least moderate
+    if cmd_lower.contains("--force") || cmd_lower.split_whitespace().any(|w| w == "-f") {
         return DangerLevel::Moderate;
     }
 
-    // Unknown commands default to Moderate
-    DangerLevel::Moderate
+    // Redirects that overwrite files
+    if cmd.contains('>') {
+        return DangerLevel::Moderate;
+    }
+
+    // Everything else is safe
+    DangerLevel::Safe
 }
 
 /// Determine whether a tool invocation should prompt the user for permission.
@@ -385,21 +359,29 @@ mod tests {
         assert_eq!(classify_bash_danger("git log --oneline"), DangerLevel::Safe);
         assert_eq!(classify_bash_danger("git status"), DangerLevel::Safe);
         assert_eq!(classify_bash_danger("git diff HEAD"), DangerLevel::Safe);
+        assert_eq!(classify_bash_danger("git push origin main"), DangerLevel::Safe);
         assert_eq!(classify_bash_danger("cargo test"), DangerLevel::Safe);
         assert_eq!(classify_bash_danger("cargo build"), DangerLevel::Safe);
         assert_eq!(classify_bash_danger("echo hello"), DangerLevel::Safe);
         assert_eq!(classify_bash_danger("cat foo.txt"), DangerLevel::Safe);
         assert_eq!(classify_bash_danger("pwd"), DangerLevel::Safe);
         assert_eq!(classify_bash_danger("cd /tmp"), DangerLevel::Safe);
+        // Unknown commands are safe
+        assert_eq!(classify_bash_danger("moderac test"), DangerLevel::Safe);
+        assert_eq!(classify_bash_danger("npm install express"), DangerLevel::Safe);
+        assert_eq!(classify_bash_danger("mycustomtool --arg"), DangerLevel::Safe);
     }
 
     #[test]
     fn test_classify_bash_danger_moderate() {
         assert_eq!(classify_bash_danger("rm foo.txt"), DangerLevel::Moderate);
-        assert_eq!(classify_bash_danger("git push origin main"), DangerLevel::Safe);
         assert_eq!(classify_bash_danger("mv a.txt b.txt"), DangerLevel::Moderate);
-        assert_eq!(classify_bash_danger("npm install express"), DangerLevel::Moderate);
         assert_eq!(classify_bash_danger("sudo apt update"), DangerLevel::Moderate);
+        assert_eq!(classify_bash_danger("kill 1234"), DangerLevel::Moderate);
+        assert_eq!(classify_bash_danger("chmod 777 file"), DangerLevel::Moderate);
+        assert_eq!(classify_bash_danger("git reset HEAD~1"), DangerLevel::Moderate);
+        assert_eq!(classify_bash_danger("echo foo > file.txt"), DangerLevel::Moderate);
+        assert_eq!(classify_bash_danger("something --force"), DangerLevel::Moderate);
     }
 
     #[test]
