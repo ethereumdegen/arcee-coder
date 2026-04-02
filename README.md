@@ -19,6 +19,9 @@ git clone https://github.com/andy-ai/arcee-code.git
 # Navigate to the project directory
 cd arcee-code
 
+# Run locally
+cargo r
+
 # Build and install the CLI
 cargo install --path .
 ```
