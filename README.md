@@ -4,6 +4,13 @@
 
 Arcee Coder is an unofficial Rust-based command-line interface that leverages Arcee AI to provide intelligent coding assistance. This tool integrates with various development workflows to help developers write, debug, and refactor code more efficiently.
 
+
+
+<img width="953" height="736" alt="image" src="https://github.com/user-attachments/assets/8e01e654-a0da-4473-92b9-c2a9229ef897" />
+
+
+
+
 ## Features
 - **AI-Powered Assistance**: Uses Arcee AI to generate code suggestions, explain concepts, and provide debugging insights
 - **Command Management**: Supports multiple development workflows through a modular command system
