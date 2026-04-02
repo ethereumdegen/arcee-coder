@@ -1,4 +1,5 @@
 pub mod render;
+pub mod thinking;
 
 use crate::commands;
 use crate::config::Config;

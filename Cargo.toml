@@ -1,7 +1,7 @@
 [package]
 name = "arcee-code"
-version = "0.1.0"
-edition = "2021"
+version = "1.91.0"
+edition = "2024"
 description = "An AI coding assistant CLI, powered by Arcee AI"
 
 [[bin]]

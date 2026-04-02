@@ -10,6 +10,7 @@ use crate::messages::normalize::normalize_for_api;
 use crate::messages::types::*;
 use crate::permissions;
 use crate::tools::{ToolContext, ToolRegistry};
+use crate::ui::thinking::ThinkingIndicator;
 use anyhow::Result;
 use colored::Colorize;
 use cost::CostTracker;
@@ -78,14 +79,28 @@ pub async fn query_loop(
         // Build API messages
         let api_messages = normalize_for_api(messages);
 
-        // Stream the response
+        // Stream the response with thinking indicator
+        let thinking = std::sync::Mutex::new(Some(ThinkingIndicator::start()));
+
         let mut on_text = |text: &str| {
+            // Stop the thinking indicator on first text output
+            if let Ok(mut guard) = thinking.lock() {
+                if let Some(indicator) = guard.take() {
+                    indicator.stop();
+                }
+            }
             print!("{text}");
             use std::io::Write;
             let _ = std::io::stdout().flush();
         };
 
         let mut on_tool_start = |_id: &str, name: &str| {
+            // Stop thinking indicator if a tool starts before any text
+            if let Ok(mut guard) = thinking.lock() {
+                if let Some(indicator) = guard.take() {
+                    indicator.stop();
+                }
+            }
             println!("\n{} {}", "Tool:".cyan().bold(), name.cyan());
         };
 
@@ -100,6 +115,13 @@ pub async fn query_loop(
                 &mut on_tool_start,
             )
             .await;
+
+        // Ensure thinking indicator is stopped after streaming completes
+        if let Ok(mut guard) = thinking.lock() {
+            if let Some(indicator) = guard.take() {
+                indicator.stop();
+            }
+        }
 
         let (content_blocks, stop_reason, usage) = match result {
             Ok(r) => r,
