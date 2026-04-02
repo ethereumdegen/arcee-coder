@@ -206,15 +206,25 @@ fn find_actual_string(content: &str, old_string: &str) -> Option<String> {
     let normalized_old = normalize_quotes(old_string);
     let normalized_content = normalize_quotes(content);
 
-    if let Some(pos) = normalized_content.find(&normalized_old) {
-        // Map the byte position back to the original content
-        // This is approximate but works for quote substitutions (same char count)
-        let end = pos + normalized_old.len();
-        if end <= content.len() {
-            Some(content[pos..end].to_string())
+    if let Some(norm_byte_pos) = normalized_content.find(&normalized_old) {
+        // Map byte position in normalized string back to original content.
+        // Curly quotes are 3 bytes in UTF-8 but normalize to 1 byte, so we
+        // must count normalized chars to find the corresponding original position.
+        let norm_char_start = normalized_content[..norm_byte_pos].chars().count();
+        let norm_char_len = normalized_old.chars().count();
+
+        // Walk original content to find byte offsets for the char range
+        let mut chars = content.char_indices();
+        let start_byte = chars.nth(norm_char_start).map(|(i, _)| i)?;
+        // Advance (norm_char_len - 1) more chars, then get end byte after that char
+        let end_byte = if norm_char_len == 0 {
+            start_byte
         } else {
-            None
-        }
+            let (i, ch) = chars.nth(norm_char_len - 1)?;
+            i + ch.len_utf8()
+        };
+
+        Some(content[start_byte..end_byte].to_string())
     } else {
         None
     }
