@@ -13,8 +13,8 @@ const DESCRIPTION: &str = "Performs exact string replacements in files.\n\n\
 Usage:\n\
 - You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file.\n\
 - When editing text from Read tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. \
-The line number prefix format is: spaces + line number + tab. Everything after that tab is the actual file content to match. \
-Never include any part of the line number prefix in the old_string or new_string.\n\
+The line number prefix format is: right-aligned line number + arrow character (→). Everything after the → is the actual file content to match. \
+NEVER include line numbers or the → prefix in old_string or new_string — only the file content itself.\n\
 - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n\
 - Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.\n\
 - The edit will FAIL if `old_string` is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use `replace_all` to change every instance of `old_string`.\n\
@@ -132,7 +132,10 @@ impl Tool for EditTool {
                 )));
             }
             return Ok(ToolOutput::error(format!(
-                "old_string not found in {}. Make sure it matches exactly. The file may have been modified since you last read it.",
+                "old_string not found in {}. Common causes: \
+                 (1) You included line numbers or the → prefix from Read output — only include the actual file content. \
+                 (2) Whitespace mismatch — ensure indentation matches exactly. \
+                 (3) The file was modified since you last read it — re-read it first.",
                 file_path.display()
             )));
         }

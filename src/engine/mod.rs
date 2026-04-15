@@ -1071,5 +1071,29 @@ fn validate_tool_input(
         }
     }
 
+    // Edit-specific: catch identical old_string/new_string before prompting for permission
+    let tool_name = tool.name();
+    if tool_name == "Edit" {
+        if let (Some(old), Some(new)) = (
+            input.get("old_string").and_then(|v| v.as_str()),
+            input.get("new_string").and_then(|v| v.as_str()),
+        ) {
+            if old == new {
+                return Some(
+                    "old_string and new_string are identical. \
+                     You MUST provide a new_string that differs from old_string. \
+                     Re-read the file if needed, then make the actual change."
+                        .to_string(),
+                );
+            }
+            if old.is_empty() {
+                return Some(
+                    "old_string cannot be empty. Provide the exact text to replace."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     None
 }
