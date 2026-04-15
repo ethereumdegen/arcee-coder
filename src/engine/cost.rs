@@ -32,6 +32,9 @@ fn parse_rate(s: &Option<String>) -> f64 {
 }
 
 /// Tracks cumulative cost across a session.
+/// Per-model token accumulation: (input_tokens, output_tokens, cache_write_tokens, cache_read_tokens).
+type PerModelUsage = HashMap<String, (u64, u64, u64, u64)>;
+
 #[derive(Debug, Clone, Default)]
 pub struct CostTracker {
     pub total_input_tokens: u64,
@@ -39,6 +42,11 @@ pub struct CostTracker {
     pub total_cache_creation_tokens: u64,
     pub total_cache_read_tokens: u64,
     pub turns: u32,
+    /// The input token count from the most recent API response.
+    /// Used for accurate auto-compact threshold checks (instead of char-based estimates).
+    pub last_input_tokens: u64,
+    /// Per-model usage breakdown for accurate cost calculation across mixed models.
+    per_model_usage: PerModelUsage,
     pricing_table: PricingTable,
 }
 
@@ -59,7 +67,36 @@ impl CostTracker {
         self.total_output_tokens += usage.output_tokens;
         self.total_cache_creation_tokens += usage.cache_creation_input_tokens.unwrap_or(0);
         self.total_cache_read_tokens += usage.cache_read_input_tokens.unwrap_or(0);
+        self.last_input_tokens = usage.input_tokens;
         self.turns += 1;
+    }
+
+    /// Record usage for a specific model (for accurate per-model cost calculation).
+    pub fn add_usage_for_model(&mut self, model: &str, usage: &Usage) {
+        self.add_usage(usage);
+        let entry = self.per_model_usage.entry(model.to_string()).or_insert((0, 0, 0, 0));
+        entry.0 += usage.input_tokens;
+        entry.1 += usage.output_tokens;
+        entry.2 += usage.cache_creation_input_tokens.unwrap_or(0);
+        entry.3 += usage.cache_read_input_tokens.unwrap_or(0);
+    }
+
+    /// Calculate total cost across all models using per-model rates.
+    pub fn total_cost_usd(&self) -> f64 {
+        if self.per_model_usage.is_empty() {
+            // Fallback: no per-model data, use aggregate with default rates
+            return self.estimate_cost_usd("trinity-large-thinking");
+        }
+        self.per_model_usage
+            .iter()
+            .map(|(model, (inp, out, cw, cr))| {
+                let (ir, or, cwr, crr) = self.model_rates(model);
+                *inp as f64 * ir / 1_000_000.0
+                    + *out as f64 * or / 1_000_000.0
+                    + *cw as f64 * cwr / 1_000_000.0
+                    + *cr as f64 * crr / 1_000_000.0
+            })
+            .sum()
     }
 
     /// Estimate cost in USD based on the model.

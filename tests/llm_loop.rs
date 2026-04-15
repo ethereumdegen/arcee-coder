@@ -11,17 +11,21 @@
 //!
 //! Run with:
 //!   cargo test --test llm_loop -- --nocapture
-//!
-//! Because these hit a live API and can take 30-120 s each, they are gated
-//! behind `#[ignore]` so they don't run on every `cargo test`.  Use:
-//!   cargo test --test llm_loop -- --ignored --nocapture
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Root of the arcee-coder repository.
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Directory for test logs.
+fn log_dir() -> PathBuf {
+    let dir = repo_root().join("test-tmp").join("logs");
+    std::fs::create_dir_all(&dir).expect("failed to create log dir");
+    dir
 }
 
 /// Path to the compiled `arcee` binary (debug build).
@@ -67,7 +71,8 @@ fn ensure_binary_built() {
 /// Run the arcee agentic loop on a working directory with a given prompt.
 ///
 /// Returns `(exit_status, stdout, stderr)`.
-fn run_arcee(cwd: &Path, prompt: &str, max_turns: usize) -> (std::process::ExitStatus, String, String) {
+/// Also writes full stdout/stderr to a log file in test-tmp/logs/.
+fn run_arcee(cwd: &Path, prompt: &str, max_turns: usize, test_name: &str) -> (std::process::ExitStatus, String, String) {
     let output = Command::new(arcee_bin())
         .args([
             prompt,
@@ -77,11 +82,29 @@ fn run_arcee(cwd: &Path, prompt: &str, max_turns: usize) -> (std::process::ExitS
         ])
         .current_dir(cwd)
         .env("ARCEE_PERMISSION_STRICTNESS", "low")
+        .env("RUST_LOG", "arcee_code=debug")
         .output()
         .expect("failed to execute arcee binary");
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // Write detailed log file
+    let log_path = log_dir().join(format!("{test_name}.log"));
+    if let Ok(mut f) = std::fs::File::create(&log_path) {
+        let _ = writeln!(f, "=== TEST: {test_name} ===");
+        let _ = writeln!(f, "CWD: {}", cwd.display());
+        let _ = writeln!(f, "Prompt: {prompt}");
+        let _ = writeln!(f, "Max turns: {max_turns}");
+        let _ = writeln!(f, "Exit status: {}", output.status);
+        let _ = writeln!(f, "");
+        let _ = writeln!(f, "==================== STDOUT ====================");
+        let _ = writeln!(f, "{stdout}");
+        let _ = writeln!(f, "");
+        let _ = writeln!(f, "==================== STDERR ====================");
+        let _ = writeln!(f, "{stderr}");
+    }
+    println!("  Log written to: {}", log_path.display());
 
     (output.status, stdout, stderr)
 }
@@ -118,7 +141,7 @@ fn prepare_starflask_temp(test_name: &str) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore] // requires live API — run with: cargo test --test llm_loop -- --ignored --nocapture
+// requires live API + ARCEE_API_KEY
 fn test_update_phone_number_on_landing_page() {
     ensure_binary_built();
 
@@ -133,24 +156,17 @@ fn test_update_phone_number_on_landing_page() {
     println!("  CWD:    {}", work_dir.display());
     println!("  Prompt: {prompt}");
 
-    let (status, stdout, stderr) = run_arcee(&work_dir, &prompt, 30);
+    let (status, stdout, stderr) = run_arcee(&work_dir, &prompt, 30, "update_phone_number");
 
     println!("=== arcee exited with: {} ===", status);
-    println!("--- stdout (last 2000 chars) ---");
-    let stdout_tail: String = stdout.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
-    println!("{stdout_tail}");
-    println!("--- stderr (last 2000 chars) ---");
-    let stderr_tail: String = stderr.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
-    println!("{stderr_tail}");
 
     // The agent should have succeeded (exit 0).
     assert!(
         status.success(),
-        "arcee exited with non-zero status: {status}"
+        "arcee exited with non-zero status: {status}\nSee test-tmp/logs/update_phone_number.log for details"
     );
 
     // Now verify the phone number was updated in the source files.
-    // We check multiple representations of the phone number.
     let founder_path = work_dir
         .join("frontend")
         .join("src")
@@ -167,6 +183,14 @@ fn test_update_phone_number_on_landing_page() {
     let content = std::fs::read_to_string(&founder_path)
         .expect("failed to read Founder.tsx");
 
+    // Append file state to the log for debugging
+    let log_path = log_dir().join("update_phone_number.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log_path) {
+        let _ = writeln!(f, "");
+        let _ = writeln!(f, "==================== FOUNDER.TSX AFTER RUN ====================");
+        let _ = writeln!(f, "{content}");
+    }
+
     // Check that the new phone number appears (in display format or tel: format)
     let has_display = content.contains(new_phone);                  // 734-555-9526
     let has_tel = content.contains("7345559526");                    // tel:7345559526
@@ -175,7 +199,8 @@ fn test_update_phone_number_on_landing_page() {
     assert!(
         has_display || has_tel || has_tel_dashes,
         "New phone number '{new_phone}' not found in Founder.tsx.\n\
-         File content (relevant lines):\n{}",
+         See test-tmp/logs/update_phone_number.log for full details.\n\
+         Relevant lines:\n{}",
         content
             .lines()
             .filter(|l| l.to_lowercase().contains("phone") || l.contains("tel") || l.contains("734") || l.contains("555"))
@@ -187,7 +212,8 @@ fn test_update_phone_number_on_landing_page() {
     let old_gone = !content.contains("734-444-9526") && !content.contains("7344449526");
     assert!(
         old_gone,
-        "Old phone number '734-444-9526' still present in Founder.tsx — agent did not replace it."
+        "Old phone number '734-444-9526' still present in Founder.tsx — agent did not replace it.\n\
+         See test-tmp/logs/update_phone_number.log for full details."
     );
 
     println!("=== PASS: Phone number successfully updated to {new_phone} ===");
@@ -196,7 +222,7 @@ fn test_update_phone_number_on_landing_page() {
 /// Ask the agent to find the phone number on the landing page and verify
 /// it correctly reports 734-444-9526.
 #[test]
-#[ignore] // requires live API — run with: cargo test --test llm_loop -- --ignored --nocapture
+// requires live API + ARCEE_API_KEY
 fn test_read_phone_number_from_landing_page() {
     ensure_binary_built();
 
@@ -207,23 +233,16 @@ fn test_read_phone_number_from_landing_page() {
     println!("  CWD:    {}", work_dir.display());
     println!("  Prompt: {prompt}");
 
-    let (status, stdout, stderr) = run_arcee(&work_dir, prompt, 20);
+    let (status, stdout, _stderr) = run_arcee(&work_dir, prompt, 20, "read_phone_number");
 
     println!("=== arcee exited with: {} ===", status);
-    println!("--- stdout (last 3000 chars) ---");
-    let stdout_tail: String = stdout.chars().rev().take(3000).collect::<Vec<_>>().into_iter().rev().collect();
-    println!("{stdout_tail}");
-    println!("--- stderr (last 1000 chars) ---");
-    let stderr_tail: String = stderr.chars().rev().take(1000).collect::<Vec<_>>().into_iter().rev().collect();
-    println!("{stderr_tail}");
 
     assert!(
         status.success(),
-        "arcee exited with non-zero status: {status}"
+        "arcee exited with non-zero status: {status}\nSee test-tmp/logs/read_phone_number.log for details"
     );
 
     // The agent's stdout should contain the phone number 734-444-9526 somewhere
-    // in its response. Check for various representations.
     let expected_phone = "734-444-9526";
     let expected_digits = "7344449526";
 
@@ -233,7 +252,7 @@ fn test_read_phone_number_from_landing_page() {
     assert!(
         has_dashed || has_digits,
         "Expected phone number '{expected_phone}' not found in arcee output.\n\
-         stdout (last 3000 chars):\n{stdout_tail}"
+         See test-tmp/logs/read_phone_number.log for full details."
     );
 
     println!("=== PASS: Agent correctly reported phone number as {expected_phone} ===");
@@ -241,7 +260,7 @@ fn test_read_phone_number_from_landing_page() {
 
 /// A lightweight sanity test: ask arcee to list files and verify it exits cleanly.
 #[test]
-#[ignore]
+// requires live API + ARCEE_API_KEY
 fn test_sanity_file_listing() {
     ensure_binary_built();
 
@@ -250,8 +269,12 @@ fn test_sanity_file_listing() {
         &work_dir,
         "List all .tsx files in frontend/src/components/sections/ and print their names.",
         10,
+        "sanity_file_listing",
     );
 
-    assert!(status.success(), "arcee exited with non-zero status");
+    assert!(
+        status.success(),
+        "arcee exited with non-zero status\nSee test-tmp/logs/sanity_file_listing.log for details"
+    );
     println!("=== PASS: sanity file listing completed ===");
 }

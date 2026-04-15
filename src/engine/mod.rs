@@ -3,6 +3,7 @@ pub mod context;
 pub mod cost;
 pub mod model_router;
 
+use crate::api::errors::{ApiError, ErrorCategory};
 use crate::api::types::*;
 use crate::config::Config;
 use crate::messages::normalize::normalize_for_api;
@@ -22,6 +23,8 @@ use std::sync::Arc;
 
 /// Maximum characters in a single tool result before truncation.
 const MAX_TOOL_RESULT_CHARS: usize = 50_000;
+/// Tool execution timeout (10 minutes).
+const TOOL_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 /// Token threshold to trigger auto-compaction (rough estimate).
 const AUTO_COMPACT_TOKEN_THRESHOLD: u64 = 80_000;
 /// Messages to keep when auto-compacting.
@@ -181,8 +184,13 @@ pub async fn query_loop(
             }
         }
 
-        // Auto-compaction check
-        let estimated_tokens = compact::estimate_tokens(messages);
+        // Auto-compaction check — prefer actual token count from last API response,
+        // fall back to char-based estimate on turn 0 (before any API response).
+        let estimated_tokens = if cost_tracker.last_input_tokens > 0 {
+            cost_tracker.last_input_tokens
+        } else {
+            compact::estimate_tokens(messages)
+        };
         if estimated_tokens > AUTO_COMPACT_TOKEN_THRESHOLD
             && messages.len() > AUTO_COMPACT_KEEP_RECENT + 2
         {
@@ -316,11 +324,17 @@ pub async fn query_loop(
             match result {
                 Ok(r) => break (r.content, r.stop_reason, r.usage),
                 Err(e) => {
-                    // Best-effort inspection of underlying ApiError to preserve
-                    // context-too-long compaction and retry behavior.
-                    let err_str = format!("{e}");
-                    let is_context_too_long = err_str.to_lowercase().contains("context")
-                        && err_str.to_lowercase().contains("too");
+                    // Downcast to ApiError for typed error classification.
+                    // Falls back to string matching if the error is not an ApiError.
+                    let api_err = e.downcast_ref::<ApiError>();
+
+                    let is_context_too_long = api_err
+                        .map(|ae| ae.category() == ErrorCategory::ContextError)
+                        .unwrap_or_else(|| {
+                            let s = format!("{e}").to_lowercase();
+                            s.contains("context") && s.contains("too")
+                        });
+
                     if is_context_too_long {
                         out.status_warn("[context too long, compacting...]");
                         *messages = compact::compact_messages_ai(
@@ -332,18 +346,40 @@ pub async fn query_loop(
                         .await;
                         continue;
                     }
-                    let is_retryable = err_str.to_lowercase().contains("rate")
-                        || err_str.to_lowercase().contains("timeout")
-                        || err_str.to_lowercase().contains("temporarily")
-                        || err_str.to_lowercase().contains("503")
-                        || err_str.to_lowercase().contains("502");
+
+                    let is_retryable = api_err
+                        .map(|ae| ae.is_retryable())
+                        .unwrap_or_else(|| {
+                            let s = format!("{e}").to_lowercase();
+                            s.contains("rate") || s.contains("timeout")
+                                || s.contains("temporarily")
+                                || s.contains("503") || s.contains("502")
+                        });
+
                     if is_retryable && api_retries < MAX_API_RETRIES {
                         api_retries += 1;
-                        let delay = 2u64.pow(api_retries);
+
+                        // Respect retry_after_secs from rate limit errors, otherwise use jitter backoff
+                        let delay_secs = api_err
+                            .and_then(|ae| match ae {
+                                ApiError::RateLimit { retry_after_secs: Some(secs) } => Some(*secs),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| {
+                                let base = 2u64.pow(api_retries);
+                                // Add jitter: 50-150% of base
+                                let nanos = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .subsec_nanos();
+                                let jitter = 0.5 + (nanos % 1000) as f64 / 1000.0;
+                                (base as f64 * jitter) as u64
+                            });
+
                         out.status_warn(&format!(
-                            "[transient API error: {e} — retrying in {delay}s ({api_retries}/{MAX_API_RETRIES})]"
+                            "[transient API error: {e} — retrying in {delay_secs}s ({api_retries}/{MAX_API_RETRIES})]"
                         ));
-                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                         continue;
                     }
                     out.status_error(&format!(
@@ -366,7 +402,7 @@ pub async fn query_loop(
             }
         }
 
-        cost_tracker.add_usage(&usage);
+        cost_tracker.add_usage_for_model(&model, &usage);
 
         // Check if streaming was interrupted by ESC
         if escape_flag.load(Ordering::Relaxed) {
@@ -569,25 +605,38 @@ pub async fn query_loop(
                 continue;
             }
 
-            let mut results = Vec::new();
+            let mut results: Vec<(String, String, bool)> = Vec::new();
             let mut had_validation_failure = false;
 
-            for (id, name, input) in &tool_uses {
-                // Check escape between tool calls
+            // ── Phase 1: Permission checks (sequential — user prompts must be serial) ──
+            // Collect approved tool calls and early-error results.
+            struct ApprovedTool {
+                index: usize,  // position in tool_uses for stable ordering
+                id: String,
+                name: String,
+                input: serde_json::Value,
+            }
+            let mut approved: Vec<ApprovedTool> = Vec::new();
+            let mut phase1_results: Vec<(usize, String, String, bool)> = Vec::new();
+            let mut interrupted = false;
+
+            for (idx, (id, name, input)) in tool_uses.iter().enumerate() {
+                // Check escape between permission prompts
                 if escape_flag.load(Ordering::Relaxed) {
                     escape_flag.store(false, Ordering::Relaxed);
                     out.newline();
                     out.status_warn(&format!(
                         "[interrupted by user during tool execution at turn {turns}]"
                     ));
-                    results.push((id.clone(), "Interrupted by user".to_string(), true));
+                    phase1_results.push((idx, id.clone(), "Interrupted by user".to_string(), true));
+                    interrupted = true;
                     break;
                 }
 
                 let tool = match tools.get(name) {
                     Some(t) => t,
                     None => {
-                        results.push((id.clone(), format!("Unknown tool: {name}"), true));
+                        phase1_results.push((idx, id.clone(), format!("Unknown tool: {name}"), true));
                         continue;
                     }
                 };
@@ -597,15 +646,15 @@ pub async fn query_loop(
                     out.status_warn(&format!(
                         "[tool '{name}' input validation failed: {validation_error}]"
                     ));
-                    results.push((id.clone(), validation_error, true));
+                    phase1_results.push((idx, id.clone(), validation_error, true));
                     had_validation_failure = true;
                     continue;
                 }
 
                 let perm_class = tool.permission(input);
                 if perm_class == PermissionClass::Forbidden {
-                    results.push((
-                        id.clone(),
+                    phase1_results.push((
+                        idx, id.clone(),
                         format!("Tool '{name}' is forbidden in this context"),
                         true,
                     ));
@@ -628,8 +677,7 @@ pub async fn query_loop(
                 let allowed = match perm {
                     permissions::PermissionResult::Allow => true,
                     permissions::PermissionResult::Deny(reason) => {
-                        results
-                            .push((id.clone(), format!("Permission denied: {reason}"), true));
+                        phase1_results.push((idx, id.clone(), format!("Permission denied: {reason}"), true));
                         continue;
                     }
                     permissions::PermissionResult::Ask => {
@@ -637,22 +685,20 @@ pub async fn query_loop(
                         if let Some(b) = bridge {
                             let detail =
                                 permissions::build_permission_detail(name, input);
-                            // block_in_place so tokio background tasks keep running
                             let allowed_by_user = tokio::task::block_in_place(|| {
                                 b.prompt_permission(detail)
                             });
                             if allowed_by_user {
                                 true
                             } else {
-                                results.push((
-                                    id.clone(),
+                                phase1_results.push((
+                                    idx, id.clone(),
                                     "User denied permission".to_string(),
                                     true,
                                 ));
                                 continue;
                             }
                         } else {
-                            // Direct stdin permission prompt (oneshot mode)
                             let description = input["description"].as_str();
                             match permissions::prompt_user_permission(
                                 name,
@@ -661,16 +707,16 @@ pub async fn query_loop(
                             ) {
                                 Ok(true) => true,
                                 Ok(false) => {
-                                    results.push((
-                                        id.clone(),
+                                    phase1_results.push((
+                                        idx, id.clone(),
                                         "User denied permission".to_string(),
                                         true,
                                     ));
                                     continue;
                                 }
                                 Err(e) => {
-                                    results.push((
-                                        id.clone(),
+                                    phase1_results.push((
+                                        idx, id.clone(),
                                         format!("Permission prompt error: {e}"),
                                         true,
                                     ));
@@ -688,29 +734,56 @@ pub async fn query_loop(
                         out.status_dim(&input_str);
                     }
 
-                    // Run PreToolUse hooks
+                    // Run PreToolUse hooks (sequential — may block)
                     if let Some(block_reason) = crate::hooks::run_pre_tool_hooks(
                         &config.hooks, name, input, &tool_context.cwd,
                     ).await {
                         out.status_warn(&format!("[hook blocked {name}: {block_reason}]"));
-                        results.push((id.clone(), format!("Blocked by hook: {block_reason}"), true));
+                        phase1_results.push((idx, id.clone(), format!("Blocked by hook: {block_reason}"), true));
                         continue;
                     }
 
-                    // Notify UI of tool execution start
+                    approved.push(ApprovedTool {
+                        index: idx,
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    });
+                }
+            }
+
+            // ── Phase 2: Execute approved tools (parallel via JoinSet) ──
+            let mut exec_results: Vec<(usize, String, String, String, bool)> = Vec::new();
+
+            if !interrupted && !approved.is_empty() {
+                // If only one tool or escape might be needed, run sequentially for simplicity
+                if approved.len() == 1 {
+                    let at = &approved[0];
+                    let tool = tools.get(&at.name).unwrap();
+
                     if let Some(b) = bridge {
-                        b.tool_exec_start(name);
+                        b.tool_exec_start(&at.name);
                     }
 
                     let tool_start = std::time::Instant::now();
+                    let tool_result = tokio::time::timeout(
+                        TOOL_EXEC_TIMEOUT,
+                        tool.call(at.input.clone(), tool_context),
+                    ).await;
 
-                    match tool.call(input.clone(), tool_context).await {
-                        Ok(result) => {
+                    match tool_result {
+                        Err(_) => {
                             let duration_ms = tool_start.elapsed().as_millis() as u64;
-
-                            // Render the tool output to its canonical string form.
-                            // Per-tool smart truncation already ran; we just cap
-                            // the overall size as a safety net.
+                            let error_msg = format!("Tool execution timed out after {}s", TOOL_EXEC_TIMEOUT.as_secs());
+                            if let Some(b) = bridge {
+                                b.tool_result(&at.name, &error_msg, true, duration_ms);
+                            } else {
+                                out.tool_result(&error_msg, true);
+                            }
+                            exec_results.push((at.index, at.id.clone(), at.name.clone(), error_msg, true));
+                        }
+                        Ok(Ok(result)) => {
+                            let duration_ms = tool_start.elapsed().as_millis() as u64;
                             let is_error = result.is_error;
                             let mut rendered = result.render();
                             if rendered.len() > MAX_TOOL_RESULT_CHARS {
@@ -724,50 +797,143 @@ pub async fn query_loop(
                                     rendered.len()
                                 );
                             }
-
                             let preview = result.preview();
 
                             if let Some(b) = bridge {
-                                b.tool_result(name, &preview, is_error, duration_ms);
+                                b.tool_result(&at.name, &preview, is_error, duration_ms);
                             } else if output_format == OutputFormat::StreamJson {
-                                StreamEvent::tool_use(name, input).emit();
-                                StreamEvent::tool_result(name, &preview, is_error).emit();
+                                StreamEvent::tool_use(&at.name, &at.input).emit();
+                                StreamEvent::tool_result(&at.name, &preview, is_error).emit();
                             } else if output_format == OutputFormat::Text {
                                 out.tool_result(&preview, is_error);
                                 if rendered.len() > 500 {
-                                    out.status_dim(&format!(
-                                        "  ... ({} total chars)",
-                                        rendered.len()
-                                    ));
+                                    out.status_dim(&format!("  ... ({} total chars)", rendered.len()));
                                 }
                             }
 
                             // Run PostToolUse hooks
                             let hook_context = crate::hooks::run_post_tool_hooks(
-                                &config.hooks, name, input, &rendered, &tool_context.cwd,
+                                &config.hooks, &at.name, &at.input, &rendered, &tool_context.cwd,
                             ).await;
                             if !hook_context.is_empty() {
-                                rendered.push_str(&format!(
-                                    "\n\n--- Hook Output ---\n{hook_context}"
-                                ));
+                                rendered.push_str(&format!("\n\n--- Hook Output ---\n{hook_context}"));
                             }
 
-                            results.push((id.clone(), rendered, is_error));
+                            exec_results.push((at.index, at.id.clone(), at.name.clone(), rendered, is_error));
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             let duration_ms = tool_start.elapsed().as_millis() as u64;
                             let error_msg = format!("Tool execution error: {e}");
-
                             if let Some(b) = bridge {
-                                b.tool_result(name, &error_msg, true, duration_ms);
+                                b.tool_result(&at.name, &error_msg, true, duration_ms);
                             } else {
                                 out.tool_result(&error_msg, true);
                             }
+                            exec_results.push((at.index, at.id.clone(), at.name.clone(), error_msg, true));
+                        }
+                    }
+                } else {
+                    // Multiple approved tools — execute in parallel via join_all
+                    // (no 'static requirement, unlike JoinSet::spawn)
 
-                            results.push((id.clone(), error_msg, true));
+                    // Notify UI of all tool starts
+                    for at in &approved {
+                        if let Some(b) = bridge {
+                            b.tool_exec_start(&at.name);
+                        }
+                    }
+
+                    let futures: Vec<_> = approved.iter().map(|at| {
+                        let tool = tools.get(&at.name).unwrap();
+                        async move {
+                            let tool_start = std::time::Instant::now();
+                            let result = tokio::time::timeout(
+                                TOOL_EXEC_TIMEOUT,
+                                tool.call(at.input.clone(), tool_context),
+                            ).await;
+                            let duration_ms = tool_start.elapsed().as_millis() as u64;
+                            (at.index, &at.id, &at.name, &at.input, result, duration_ms)
+                        }
+                    }).collect();
+
+                    let parallel_results = futures::future::join_all(futures).await;
+
+                    for (index, id, name, input, tool_result, duration_ms) in parallel_results {
+                        match tool_result {
+                            Err(_) => {
+                                let error_msg = format!("Tool execution timed out after {}s", TOOL_EXEC_TIMEOUT.as_secs());
+                                if let Some(b) = bridge {
+                                    b.tool_result(name, &error_msg, true, duration_ms);
+                                } else {
+                                    out.tool_result(&error_msg, true);
+                                }
+                                exec_results.push((index, id.clone(), name.clone(), error_msg, true));
+                            }
+                            Ok(Ok(result)) => {
+                                let is_error = result.is_error;
+                                let mut rendered = result.render();
+                                if rendered.len() > MAX_TOOL_RESULT_CHARS {
+                                    let truncated = crate::tools::path_safety::safe_truncate(
+                                        &rendered,
+                                        MAX_TOOL_RESULT_CHARS,
+                                    );
+                                    rendered = format!(
+                                        "{}\n\n... (truncated, {} total chars)",
+                                        truncated,
+                                        rendered.len()
+                                    );
+                                }
+                                let preview = result.preview();
+
+                                if let Some(b) = bridge {
+                                    b.tool_result(name, &preview, is_error, duration_ms);
+                                } else if output_format == OutputFormat::StreamJson {
+                                    StreamEvent::tool_use(name, input).emit();
+                                    StreamEvent::tool_result(name, &preview, is_error).emit();
+                                } else if output_format == OutputFormat::Text {
+                                    out.tool_result(&preview, is_error);
+                                    if rendered.len() > 500 {
+                                        out.status_dim(&format!("  ... ({} total chars)", rendered.len()));
+                                    }
+                                }
+
+                                // Run PostToolUse hooks
+                                let hook_context = crate::hooks::run_post_tool_hooks(
+                                    &config.hooks, name, input, &rendered, &tool_context.cwd,
+                                ).await;
+                                if !hook_context.is_empty() {
+                                    rendered.push_str(&format!("\n\n--- Hook Output ---\n{hook_context}"));
+                                }
+
+                                exec_results.push((index, id.clone(), name.clone(), rendered, is_error));
+                            }
+                            Ok(Err(e)) => {
+                                let error_msg = format!("Tool execution error: {e}");
+                                if let Some(b) = bridge {
+                                    b.tool_result(name, &error_msg, true, duration_ms);
+                                } else {
+                                    out.tool_result(&error_msg, true);
+                                }
+                                exec_results.push((index, id.clone(), name.clone(), error_msg, true));
+                            }
                         }
                     }
                 }
+            }
+
+            // ── Phase 3: Reassemble results in original tool_use order ──
+            // Merge phase1_results and exec_results, sorted by original index.
+            let mut all_indexed: Vec<(usize, String, String, bool)> = Vec::new();
+            for (idx, id, content, is_error) in phase1_results {
+                all_indexed.push((idx, id, content, is_error));
+            }
+            for (idx, id, _name, content, is_error) in exec_results {
+                all_indexed.push((idx, id, content, is_error));
+            }
+            all_indexed.sort_by_key(|(idx, _, _, _)| *idx);
+
+            for (_, id, content, is_error) in all_indexed {
+                results.push((id, content, is_error));
             }
 
             // Add tool results as user message
@@ -797,7 +963,7 @@ pub async fn query_loop(
 
         // Check budget
         if let Some(budget) = config.budget_usd {
-            let current_cost = cost_tracker.estimate_cost_usd(&config.model);
+            let current_cost = cost_tracker.total_cost_usd();
             if current_cost >= budget {
                 out.status_error(&format!(
                     "[loop exit: budget ${budget:.2} exhausted (spent ${current_cost:.2})]"

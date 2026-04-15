@@ -100,12 +100,13 @@ pub fn pick_model(
 /// Tools that are simple read-only operations — mini handles these fine.
 const LIGHT_TOOLS: &[&str] = &[
     "Read", "Glob", "Grep", "WebFetch", "TaskList", "TaskGet", "LSP",
+    "AskUserQuestion", "TaskOutput", "WebSearch", "EnterPlanMode", "ExitPlanMode",
 ];
 
 /// Tools that need reasoning — always use heavy.
 const HEAVY_TOOLS: &[&str] = &[
     "Edit", "Write", "Bash", "Agent", "NotebookEdit",
-    "TaskCreate", "TaskUpdate",
+    "TaskCreate", "TaskUpdate", "Skill", "EnterWorktree", "ExitWorktree",
 ];
 
 /// Classify the upcoming turn based on heuristics + intensity preference.

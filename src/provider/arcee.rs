@@ -48,7 +48,7 @@ impl Provider for ArceeProvider {
         self.client
             .fetch_models()
             .await
-            .map_err(|e| anyhow::anyhow!("{e}"))
+            .map_err(|e| anyhow::anyhow!(e))
     }
 
     async fn stream_message(
@@ -92,7 +92,7 @@ impl Provider for ArceeProvider {
                 escape_ref,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         Ok(ProviderResponse {
             content: result.0,

@@ -40,7 +40,11 @@ impl Session {
     pub fn save(&self) -> Result<()> {
         paths::ensure_dirs()?;
         let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(self.file_path(), content)?;
+        let path = self.file_path();
+        // Atomic write: write to temp file then rename (POSIX atomic).
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &content)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 

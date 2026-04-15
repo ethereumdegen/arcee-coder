@@ -43,7 +43,7 @@ fn build_transcript(messages: &[Message]) -> String {
                 for c in &u.content {
                     match c {
                         UserContent::Text(t) => {
-                            let preview: String = t.chars().take(1000).collect();
+                            let preview: String = t.chars().take(3000).collect();
                             parts.push(format!("User: {preview}"));
                         }
                         UserContent::ToolResult {
@@ -56,7 +56,7 @@ fn build_transcript(messages: &[Message]) -> String {
                             } else {
                                 "Tool Result"
                             };
-                            let preview: String = content.chars().take(500).collect();
+                            let preview: String = content.chars().take(2000).collect();
                             parts.push(format!("{label}: {preview}"));
                         }
                     }
@@ -66,14 +66,14 @@ fn build_transcript(messages: &[Message]) -> String {
                 for block in &a.content {
                     match block {
                         ContentBlock::Text { text } => {
-                            let preview: String = text.chars().take(1000).collect();
+                            let preview: String = text.chars().take(3000).collect();
                             parts.push(format!("Assistant: {preview}"));
                         }
                         ContentBlock::ToolUse { name, input, .. } => {
                             let args: String = serde_json::to_string(input)
                                 .unwrap_or_default()
                                 .chars()
-                                .take(200)
+                                .take(500)
                                 .collect();
                             parts.push(format!("Tool Call: {name}({args})"));
                         }
@@ -87,28 +87,51 @@ fn build_transcript(messages: &[Message]) -> String {
     parts.join("\n")
 }
 
-/// Fallback: build a simple truncated summary (no API call).
+/// Fallback: build a structured summary (no API call).
 fn build_fallback_summary(old_messages: &[Message]) -> String {
     let mut summary_parts = Vec::new();
+    let mut user_msg_count = 0usize;
+    let mut assistant_msg_count = 0usize;
+    let mut tool_call_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut files_touched: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for msg in old_messages {
         match msg {
             Message::User(u) => {
                 for c in &u.content {
                     if let UserContent::Text(t) = c {
-                        let preview: String = t.chars().take(200).collect();
+                        user_msg_count += 1;
+                        let preview: String = t.chars().take(500).collect();
                         summary_parts.push(format!("User: {preview}"));
                     }
                 }
             }
             Message::Assistant(a) => {
+                assistant_msg_count += 1;
                 for block in &a.content {
                     match block {
                         ContentBlock::Text { text } => {
-                            let preview: String = text.chars().take(200).collect();
+                            let preview: String = text.chars().take(500).collect();
                             summary_parts.push(format!("Assistant: {preview}"));
                         }
-                        ContentBlock::ToolUse { name, .. } => {
-                            summary_parts.push(format!("Tool: {name}"));
+                        ContentBlock::ToolUse { name, input, .. } => {
+                            *tool_call_counts.entry(name.clone()).or_insert(0) += 1;
+                            // Extract file paths from common tool params
+                            for key in &["file_path", "path", "pattern"] {
+                                if let Some(v) = input.get(key).and_then(|v| v.as_str()) {
+                                    files_touched.insert(v.to_string());
+                                }
+                            }
+                            if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+                                // Extract paths from short commands
+                                if cmd.len() < 200 {
+                                    summary_parts.push(format!("Tool: {name}({cmd})"));
+                                } else {
+                                    summary_parts.push(format!("Tool: {name}"));
+                                }
+                            } else {
+                                summary_parts.push(format!("Tool: {name}"));
+                            }
                         }
                         _ => {}
                     }
@@ -118,8 +141,28 @@ fn build_fallback_summary(old_messages: &[Message]) -> String {
         }
     }
 
+    // Build structured header
+    let tool_summary: String = if tool_call_counts.is_empty() {
+        String::new()
+    } else {
+        let parts: Vec<String> = tool_call_counts
+            .iter()
+            .map(|(name, count)| format!("{name} x{count}"))
+            .collect();
+        format!(", {} tool calls ({})", parts.iter().map(|_| 1).sum::<usize>(), parts.join(", "))
+    };
+
+    let files_section = if files_touched.is_empty() {
+        String::new()
+    } else {
+        let mut files: Vec<_> = files_touched.into_iter().collect();
+        files.sort();
+        format!("\nFiles touched: {}", files.join(", "))
+    };
+
     format!(
-        "[Context compacted — {} earlier messages summarized (fallback)]\n{}",
+        "[Context compacted — {} earlier messages summarized (fallback)]\n\
+         {user_msg_count} user messages, {assistant_msg_count} assistant responses{tool_summary}{files_section}\n\n{}",
         old_messages.len(),
         summary_parts.join("\n")
     )
@@ -193,6 +236,9 @@ pub async fn compact_messages_ai(
     compacted
 }
 
+/// Compaction API timeout — if summarization takes longer than this, fall through to fallback.
+const COMPACT_API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Call the provider to generate a summary of the conversation.
 async fn summarize_with_api(
     provider: &dyn Provider,
@@ -221,10 +267,13 @@ async fn summarize_with_api(
         thinking_budget: None,
     };
 
-    let response = provider
-        .stream_message(request, &mut on_event, None)
-        .await
-        .map_err(|e| format!("{e}"))?;
+    let response = tokio::time::timeout(
+        COMPACT_API_TIMEOUT,
+        provider.stream_message(request, &mut on_event, None),
+    )
+    .await
+    .map_err(|_| "compaction API call timed out after 60s".to_string())?
+    .map_err(|e| format!("{e}"))?;
 
     // Extract text from response
     let mut summary = String::new();

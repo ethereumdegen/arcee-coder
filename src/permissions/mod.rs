@@ -192,6 +192,39 @@ fn classify_single_command(cmd: &str) -> DangerLevel {
         return DangerLevel::Moderate;
     }
 
+    // Command substitution in arguments — potential injection vector
+    if cmd.contains("$(") || cmd.contains('`') {
+        return DangerLevel::Moderate;
+    }
+
+    // Pipe chains to privilege-escalating or file-writing commands
+    if cmd.contains('|') {
+        let pipe_targets = ["sudo", "tee", "sh", "bash", "zsh", "xargs"];
+        for target in &pipe_targets {
+            if cmd_lower.contains(&format!("| {target}"))
+                || cmd_lower.contains(&format!("|{target}"))
+            {
+                return DangerLevel::Moderate;
+            }
+        }
+    }
+
+    // Redirects or writes to sensitive paths
+    let sensitive_paths = ["/etc/", "~/.ssh/", "/root/", "/var/log/", "~/.bashrc", "~/.zshrc", "~/.profile"];
+    for path in &sensitive_paths {
+        if cmd.contains(path) || cmd_lower.contains(path) {
+            return DangerLevel::Moderate;
+        }
+    }
+
+    // Environment variable expansion in paths (potential path traversal)
+    if cmd.contains("$HOME/") || cmd.contains("${HOME}") || cmd.contains("$USER") {
+        // Only flag if combined with write operations
+        if cmd.contains('>') || first_word == "mv" || first_word == "cp" {
+            return DangerLevel::Moderate;
+        }
+    }
+
     // Everything else is safe
     DangerLevel::Safe
 }

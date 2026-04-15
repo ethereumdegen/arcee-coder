@@ -66,8 +66,14 @@ pub fn normalize_for_api(messages: &[Message]) -> Vec<ChatMessage> {
                                 },
                             });
                         }
-                        ContentBlock::Thinking { .. } => {
-                            // Thinking blocks are not sent back to the API
+                        ContentBlock::Thinking { thinking } => {
+                            // Preserve thinking blocks for providers that support
+                            // extended thinking / chain-of-thought. Included as a
+                            // prefixed text segment so the model can build on its
+                            // prior reasoning.
+                            if !thinking.is_empty() {
+                                text_parts.push(format!("<thinking>\n{thinking}\n</thinking>"));
+                            }
                         }
                     }
                 }

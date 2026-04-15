@@ -1,5 +1,4 @@
 use crate::api::errors::ApiError;
-use crate::api::retry::{with_retry, RetryConfig};
 use crate::api::streaming::{SseStream, StreamAccumulator};
 use crate::api::types::*;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
@@ -172,8 +171,6 @@ impl ApiClient {
         on_tool_use_start: &mut (dyn FnMut(&str, &str) + Send),
         escape_flag: Option<&Arc<AtomicBool>>,
     ) -> Result<(Vec<ContentBlock>, StopReason, Usage), ApiError> {
-        let retry_config = RetryConfig::default();
-
         // Prepend system message
         let mut all_messages = vec![ChatMessage::system(system_prompt)];
         all_messages.extend(messages);
@@ -212,11 +209,9 @@ impl ApiClient {
             );
         }
 
-        let mut stream = with_retry(&retry_config, || {
-            let req = request.clone();
-            async move { self.stream_chat(req).await }
-        })
-        .await?;
+        // No retry here — the engine layer handles retries with richer context
+        // (compaction on context-too-long, jitter backoff, retry_after_secs).
+        let mut stream = self.stream_chat(request).await?;
 
         let mut accum = StreamAccumulator::new();
         let mut notified_tool_calls: std::collections::HashSet<usize> =
@@ -225,7 +220,14 @@ impl ApiClient {
         let stream_start = std::time::Instant::now();
         let mut chunk_count = 0u64;
 
-        while let Some(chunk_result) = stream.next().await {
+        /// Per-chunk streaming timeout — if no SSE chunk arrives within this
+        /// duration the stream is considered stalled.
+        const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+        while let Some(chunk_result) = tokio::time::timeout(CHUNK_TIMEOUT, stream.next())
+            .await
+            .map_err(|_| ApiError::StreamParse("chunk timeout: no data received for 60s".into()))?
+        {
             // Check escape flag during streaming — break immediately so the
             // stream is dropped (cancelling the HTTP connection, like AbortController.abort())
             if let Some(flag) = escape_flag {
