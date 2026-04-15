@@ -3,14 +3,14 @@ pub mod context;
 pub mod cost;
 pub mod model_router;
 
-use crate::api::client::ApiClient;
 use crate::api::types::*;
 use crate::config::Config;
 use crate::messages::normalize::normalize_for_api;
 use crate::messages::types::*;
 use crate::output::{OutputFormat, StreamEvent};
 use crate::permissions;
-use crate::tools::{ToolContext, ToolRegistry};
+use crate::provider::{Provider, ProviderEvent, ProviderRequest};
+use crate::tools::{PermissionClass, ToolContext, ToolRegistry};
 use crate::ui::bridge::UiBridge;
 use crate::ui::events::StatusLevel;
 use crate::ui::thinking::ThinkingIndicator;
@@ -99,7 +99,7 @@ impl<'a> Output<'a> {
 
 /// Run the main query loop: send messages to the API, execute tool calls, repeat.
 pub async fn query_loop(
-    client: &ApiClient,
+    provider: &dyn Provider,
     messages: &mut Vec<Message>,
     tools: &ToolRegistry,
     config: &Config,
@@ -195,7 +195,7 @@ pub async fn query_loop(
                 &tool_context.cwd,
             ).await;
             *messages = compact::compact_messages_ai(
-                client,
+                provider,
                 model_router::MODEL_LIGHT,
                 messages,
                 AUTO_COMPACT_KEEP_RECENT,
@@ -250,11 +250,10 @@ pub async fn query_loop(
         let (content_blocks, stop_reason, usage) = loop {
             let api_messages = normalize_for_api(messages);
 
-            // Create streaming callbacks — bridge-based or print-based
-            let bridge_for_text = bridge.cloned();
-            let bridge_for_tool = bridge.cloned();
+            // Create streaming event sink — bridge-based or print-based.
+            let bridge_for_event = bridge.cloned();
 
-            // ThinkingIndicator only used in non-bridge (oneshot) mode
+            // ThinkingIndicator only used in non-bridge (oneshot) mode.
             let thinking = if bridge.is_none() {
                 std::sync::Mutex::new(Some(ThinkingIndicator::start()))
             } else {
@@ -262,87 +261,91 @@ pub async fn query_loop(
             };
 
             let md = &md_renderer;
-            let mut on_text = move |text: &str| {
-                if let Some(ref b) = bridge_for_text {
-                    // Bridge mode: pass raw text — iocraft handles its own rendering
-                    b.stream_text(text);
-                } else {
-                    match output_format {
-                        OutputFormat::StreamJson => {
-                            StreamEvent::text(text).emit();
-                        }
-                        OutputFormat::Json => {
-                            // Suppress streaming output; will emit final JSON at end
-                        }
-                        OutputFormat::Text => {
-                            if let Ok(mut guard) = thinking.lock() {
-                                if let Some(indicator) = guard.take() {
-                                    indicator.stop();
+            let mut on_event = move |event: ProviderEvent| match event {
+                ProviderEvent::TextDelta(text) => {
+                    if let Some(ref b) = bridge_for_event {
+                        b.stream_text(&text);
+                    } else {
+                        match output_format {
+                            OutputFormat::StreamJson => {
+                                StreamEvent::text(&text).emit();
+                            }
+                            OutputFormat::Json => {}
+                            OutputFormat::Text => {
+                                if let Ok(mut guard) = thinking.lock() {
+                                    if let Some(indicator) = guard.take() {
+                                        indicator.stop();
+                                    }
                                 }
+                                if let Ok(mut renderer) = md.lock() {
+                                    let formatted = renderer.push_text(&text);
+                                    print!("{formatted}");
+                                } else {
+                                    print!("{text}");
+                                }
+                                use std::io::Write;
+                                let _ = std::io::stdout().flush();
                             }
-                            // Render markdown for terminal output
-                            if let Ok(mut renderer) = md.lock() {
-                                let formatted = renderer.push_text(text);
-                                print!("{formatted}");
-                            } else {
-                                print!("{text}");
-                            }
-                            use std::io::Write;
-                            let _ = std::io::stdout().flush();
                         }
                     }
                 }
-            };
-
-            let mut on_tool_start = move |id: &str, name: &str| {
-                if let Some(ref b) = bridge_for_tool {
-                    b.stream_tool_start(id, name);
-                } else if output_format == OutputFormat::Text {
-                    println!("\n{} {}", "Tool:".cyan().bold(), name.cyan());
+                ProviderEvent::ThinkingDelta(_) => {}
+                ProviderEvent::ToolUseStart { id, name } => {
+                    if let Some(ref b) = bridge_for_event {
+                        b.stream_tool_start(&id, &name);
+                    } else if output_format == OutputFormat::Text {
+                        println!("\n{} {}", "Tool:".cyan().bold(), name.cyan());
+                    }
                 }
+                ProviderEvent::ToolUseArgsDelta { .. } => {}
             };
 
-            let result = client
-                .send_message_with_model(
-                    &model,
-                    &system_prompt,
-                    api_messages,
-                    tool_defs.clone(),
-                    config.max_tokens,
-                    &mut on_text,
-                    &mut on_tool_start,
-                    Some(escape_flag),
-                )
+            let request = ProviderRequest {
+                model: model.clone(),
+                system: system_prompt.clone(),
+                messages: api_messages,
+                tools: tool_defs.to_vec(),
+                max_tokens: config.max_tokens,
+                thinking_budget: None,
+            };
+
+            let result = provider
+                .stream_message(request, &mut on_event, Some(escape_flag.clone()))
                 .await;
 
             match result {
-                Ok(r) => break r,
-                Err(crate::api::errors::ApiError::ContextTooLong(_)) => {
-                    out.status_warn("[context too long, compacting...]");
-                    *messages = compact::compact_messages_ai(
-                        client,
-                        model_router::MODEL_LIGHT,
-                        messages,
-                        6,
-                    )
-                    .await;
-                    continue;
-                }
-                Err(e) if e.is_retryable() && api_retries < MAX_API_RETRIES => {
-                    api_retries += 1;
-                    let delay = match &e {
-                        crate::api::errors::ApiError::RateLimit {
-                            retry_after_secs: Some(s),
-                        } => *s,
-                        _ => 2u64.pow(api_retries),
-                    };
-                    out.status_warn(&format!(
-                        "[transient API error: {e} — retrying in {delay}s ({api_retries}/{MAX_API_RETRIES})]"
-                    ));
-                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                    continue;
-                }
+                Ok(r) => break (r.content, r.stop_reason, r.usage),
                 Err(e) => {
+                    // Best-effort inspection of underlying ApiError to preserve
+                    // context-too-long compaction and retry behavior.
+                    let err_str = format!("{e}");
+                    let is_context_too_long = err_str.to_lowercase().contains("context")
+                        && err_str.to_lowercase().contains("too");
+                    if is_context_too_long {
+                        out.status_warn("[context too long, compacting...]");
+                        *messages = compact::compact_messages_ai(
+                            provider,
+                            model_router::MODEL_LIGHT,
+                            messages,
+                            6,
+                        )
+                        .await;
+                        continue;
+                    }
+                    let is_retryable = err_str.to_lowercase().contains("rate")
+                        || err_str.to_lowercase().contains("timeout")
+                        || err_str.to_lowercase().contains("temporarily")
+                        || err_str.to_lowercase().contains("503")
+                        || err_str.to_lowercase().contains("502");
+                    if is_retryable && api_retries < MAX_API_RETRIES {
+                        api_retries += 1;
+                        let delay = 2u64.pow(api_retries);
+                        out.status_warn(&format!(
+                            "[transient API error: {e} — retrying in {delay}s ({api_retries}/{MAX_API_RETRIES})]"
+                        ));
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        continue;
+                    }
                     out.status_error(&format!(
                         "[query_loop exiting: API error after {api_retries} retries: {e}]"
                     ));
@@ -599,7 +602,16 @@ pub async fn query_loop(
                     continue;
                 }
 
-                let is_read_only = tool.is_read_only(input);
+                let perm_class = tool.permission(input);
+                if perm_class == PermissionClass::Forbidden {
+                    results.push((
+                        id.clone(),
+                        format!("Tool '{name}' is forbidden in this context"),
+                        true,
+                    ));
+                    continue;
+                }
+                let is_read_only = perm_class.is_read_only();
                 let current_mode = *tool_context.permission_mode.lock().await;
 
                 // Check permissions
@@ -693,65 +705,54 @@ pub async fn query_loop(
                     let tool_start = std::time::Instant::now();
 
                     match tool.call(input.clone(), tool_context).await {
-                        Ok(mut result) => {
+                        Ok(result) => {
                             let duration_ms = tool_start.elapsed().as_millis() as u64;
 
-                            // Truncate large tool results
-                            if result.content.len() > MAX_TOOL_RESULT_CHARS {
-                                let truncated =
-                                    crate::tools::path_safety::safe_truncate(
-                                        &result.content,
-                                        MAX_TOOL_RESULT_CHARS,
-                                    );
-                                result.content = format!(
+                            // Render the tool output to its canonical string form.
+                            // Per-tool smart truncation already ran; we just cap
+                            // the overall size as a safety net.
+                            let is_error = result.is_error;
+                            let mut rendered = result.render();
+                            if rendered.len() > MAX_TOOL_RESULT_CHARS {
+                                let truncated = crate::tools::path_safety::safe_truncate(
+                                    &rendered,
+                                    MAX_TOOL_RESULT_CHARS,
+                                );
+                                rendered = format!(
                                     "{}\n\n... (truncated, {} total chars)",
                                     truncated,
-                                    result.content.len()
+                                    rendered.len()
                                 );
                             }
 
-                            // Show first line only as preview (multi-line results look broken in terminal)
-                            let preview: String = result
-                                .content
-                                .lines()
-                                .next()
-                                .unwrap_or("")
-                                .chars()
-                                .take(500)
-                                .collect();
+                            let preview = result.preview();
 
                             if let Some(b) = bridge {
-                                b.tool_result(
-                                    name,
-                                    &preview,
-                                    result.is_error,
-                                    duration_ms,
-                                );
+                                b.tool_result(name, &preview, is_error, duration_ms);
                             } else if output_format == OutputFormat::StreamJson {
                                 StreamEvent::tool_use(name, input).emit();
-                                StreamEvent::tool_result(name, &preview, result.is_error).emit();
+                                StreamEvent::tool_result(name, &preview, is_error).emit();
                             } else if output_format == OutputFormat::Text {
-                                out.tool_result(&preview, result.is_error);
-                                if result.content.len() > 500 {
+                                out.tool_result(&preview, is_error);
+                                if rendered.len() > 500 {
                                     out.status_dim(&format!(
                                         "  ... ({} total chars)",
-                                        result.content.len()
+                                        rendered.len()
                                     ));
                                 }
                             }
 
                             // Run PostToolUse hooks
                             let hook_context = crate::hooks::run_post_tool_hooks(
-                                &config.hooks, name, input, &result.content, &tool_context.cwd,
+                                &config.hooks, name, input, &rendered, &tool_context.cwd,
                             ).await;
                             if !hook_context.is_empty() {
-                                result.content.push_str(&format!(
+                                rendered.push_str(&format!(
                                     "\n\n--- Hook Output ---\n{hook_context}"
                                 ));
                             }
 
-                            results
-                                .push((id.clone(), result.content, result.is_error));
+                            results.push((id.clone(), rendered, is_error));
                         }
                         Err(e) => {
                             let duration_ms = tool_start.elapsed().as_millis() as u64;

@@ -1,116 +1,85 @@
-use crate::tools::{Tool, ToolContext, ToolResult};
+use crate::toon::ToonValue;
+use crate::tools::{
+    PermissionClass, Tool, ToolBody, ToolContext, ToolOutput, Truncation,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 pub struct GrepTool;
 
 const DEFAULT_HEAD_LIMIT: usize = 250;
 const MAX_OUTPUT_CHARS: usize = 20_000;
 
-#[async_trait]
-impl Tool for GrepTool {
-    fn name(&self) -> &str {
-        "Grep"
-    }
+const DESCRIPTION: &str = "A powerful search tool built on ripgrep\n\n\
+  Usage:\n\
+  - ALWAYS use Grep for search tasks. NEVER invoke `grep` or `rg` as a Bash command. The Grep tool has been optimized for correct permissions and access.\n\
+  - Supports full regex syntax (e.g., \"log.*Error\", \"function\\\\s+\\\\w+\")\n\
+  - Filter files with glob parameter (e.g., \"*.js\", \"**/*.tsx\") or type parameter (e.g., \"js\", \"py\", \"rust\")\n\
+  - Output modes: \"content\" shows matching lines, \"files_with_matches\" shows only file paths (default), \"count\" shows match counts\n\
+  - Use Agent tool for open-ended searches requiring multiple rounds\n\
+  - Pattern syntax: Uses ripgrep (not grep) - literal braces need escaping (use `interface\\\\{\\\\}` to find `interface{}` in Go code)\n\
+  - Multiline matching: By default patterns match within single lines only. For cross-line patterns like `struct \\\\{[\\\\s\\\\S]*?field`, use `multiline: true`";
 
-    fn description(&self) -> String {
-        "A powerful search tool built on ripgrep.\n\n\
-         REQUIRED parameter: \"pattern\" (string) — the regex pattern to search for.\n\
-         Example call: {\"pattern\": \"fn main\", \"glob\": \"*.rs\"}\n\n\
-         Usage:\n\
-         - ALWAYS use Grep for search tasks. NEVER invoke `grep` or `rg` as a Bash command.\n\
-         - Supports full regex syntax (e.g., \"log.*Error\", \"function\\s+\\w+\")\n\
-         - Filter files with glob parameter (e.g., \"*.js\", \"**/*.tsx\") or type parameter \
-         (e.g., \"js\", \"py\", \"rust\")\n\
-         - Output modes: \"content\" shows matching lines, \"files_with_matches\" shows only \
-         file paths (default), \"count\" shows match counts\n\
-         - Pattern syntax: Uses ripgrep (not grep) - literal braces need escaping \
-         (use `interface\\{\\}` to find `interface{}` in Go code)\n\
-         - Multiline matching: By default patterns match within single lines only. \
-         For cross-line patterns like `struct \\{[\\s\\S]*?field`, use `multiline: true`"
-            .to_string()
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
+fn schema() -> &'static serde_json::Value {
+    static CELL: OnceLock<serde_json::Value> = OnceLock::new();
+    CELL.get_or_init(|| {
         json!({
             "type": "object",
             "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "The regular expression pattern to search for in file contents"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "File or directory to search in (rg PATH). Defaults to current working directory."
-                },
-                "glob": {
-                    "type": "string",
-                    "description": "Glob pattern to filter files (e.g. \"*.js\", \"*.{ts,tsx}\") - maps to rg --glob"
-                },
+                "pattern": { "type": "string", "description": "Regex pattern to search for" },
+                "path": { "type": "string", "description": "File or directory to search in" },
+                "glob": { "type": "string", "description": "Glob filter (e.g. \"*.rs\")" },
                 "output_mode": {
                     "type": "string",
                     "enum": ["content", "files_with_matches", "count"],
-                    "description": "Output mode: \"content\" shows matching lines (supports -A/-B/-C context, -n line numbers, head_limit), \"files_with_matches\" shows file paths (supports head_limit), \"count\" shows match counts (supports head_limit). Defaults to \"files_with_matches\"."
+                    "description": "Output mode (default: files_with_matches)"
                 },
-                "-B": {
-                    "type": "number",
-                    "description": "Number of lines to show before each match (rg -B). Requires output_mode: \"content\", ignored otherwise."
-                },
-                "-A": {
-                    "type": "number",
-                    "description": "Number of lines to show after each match (rg -A). Requires output_mode: \"content\", ignored otherwise."
-                },
-                "-C": {
-                    "type": "number",
-                    "description": "Alias for context."
-                },
-                "context": {
-                    "type": "number",
-                    "description": "Number of lines to show before and after each match (rg -C). Requires output_mode: \"content\", ignored otherwise."
-                },
-                "-n": {
-                    "type": "boolean",
-                    "description": "Show line numbers in output (rg -n). Requires output_mode: \"content\", ignored otherwise. Defaults to true."
-                },
-                "-i": {
-                    "type": "boolean",
-                    "description": "Case insensitive search (rg -i)"
-                },
-                "type": {
-                    "type": "string",
-                    "description": "File type to search (rg --type). Common types: js, py, rust, go, java, etc. More efficient than include for standard file types."
-                },
-                "head_limit": {
-                    "type": "number",
-                    "description": "Limit output to first N lines/entries, equivalent to \"| head -N\". Works across all output modes: content (limits output lines), files_with_matches (limits file paths), count (limits count entries). Defaults to 250 when unspecified. Pass 0 for unlimited."
-                },
-                "offset": {
-                    "type": "number",
-                    "description": "Skip first N lines/entries before applying head_limit, equivalent to \"| tail -n +N | head -N\". Works across all output modes. Defaults to 0."
-                },
-                "multiline": {
-                    "type": "boolean",
-                    "description": "Enable multiline mode where . matches newlines and patterns can span lines (rg -U --multiline-dotall). Default: false."
-                }
+                "-B": { "type": "number", "description": "Lines of before-context" },
+                "-A": { "type": "number", "description": "Lines of after-context" },
+                "-C": { "type": "number", "description": "Lines of context (both sides)" },
+                "context": { "type": "number", "description": "Alias for -C" },
+                "-n": { "type": "boolean", "description": "Show line numbers (default true)" },
+                "-i": { "type": "boolean", "description": "Case insensitive" },
+                "type": { "type": "string", "description": "File type (e.g. \"rust\")" },
+                "head_limit": { "type": "number", "description": "Max result lines (default 250)" },
+                "offset": { "type": "number", "description": "Skip first N lines" },
+                "multiline": { "type": "boolean", "description": "Enable multiline dotall" },
+                "full": { "type": "boolean", "description": "Disable head_limit and return everything" }
             },
             "required": ["pattern"]
         })
+    })
+}
+
+#[async_trait]
+impl Tool for GrepTool {
+    fn name(&self) -> &'static str {
+        "Grep"
     }
 
-    fn is_read_only(&self, _input: &serde_json::Value) -> bool {
-        true
+    fn description(&self) -> &'static str {
+        DESCRIPTION
     }
 
-    async fn call(&self, input: serde_json::Value, context: &ToolContext) -> Result<ToolResult> {
+    fn input_schema(&self) -> &'static serde_json::Value {
+        schema()
+    }
+
+    fn permission(&self, _input: &serde_json::Value) -> PermissionClass {
+        PermissionClass::ReadOnly
+    }
+
+    async fn call(&self, input: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
         let pattern = input["pattern"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'pattern' parameter"))?;
-
         if pattern.is_empty() {
-            return Ok(ToolResult::error("Pattern cannot be empty"));
+            return Ok(ToolOutput::error("Pattern cannot be empty"));
         }
+        let full = input["full"].as_bool().unwrap_or(false);
 
         let search_path = match input["path"].as_str() {
             Some(p) => {
@@ -128,23 +97,25 @@ impl Tool for GrepTool {
         let type_filter = input["type"].as_str().map(String::from);
         let output_mode = input["output_mode"]
             .as_str()
-            .unwrap_or("files_with_matches");
+            .unwrap_or("files_with_matches")
+            .to_string();
 
-        // Context lines: support -C, -B, -A aliases
-        let context_lines = input["context"].as_u64()
+        let context_lines = input["context"]
+            .as_u64()
             .or_else(|| input["-C"].as_u64())
             .unwrap_or(0) as usize;
         let before_context = input["-B"].as_u64().unwrap_or(0) as usize;
         let after_context = input["-A"].as_u64().unwrap_or(0) as usize;
-
-        let case_insensitive = input["-i"].as_bool()
-            .or_else(|| input["case_insensitive"].as_bool())
-            .unwrap_or(false);
+        let case_insensitive = input["-i"].as_bool().unwrap_or(false);
         let show_line_numbers = input["-n"].as_bool().unwrap_or(true);
-        let head_limit = input["head_limit"]
-            .as_u64()
-            .map(|n| n as usize)
-            .unwrap_or(DEFAULT_HEAD_LIMIT);
+        let head_limit = if full {
+            0
+        } else {
+            input["head_limit"]
+                .as_u64()
+                .map(|n| n as usize)
+                .unwrap_or(DEFAULT_HEAD_LIMIT)
+        };
         let offset = input["offset"].as_u64().unwrap_or(0) as usize;
         let multiline = input["multiline"].as_bool().unwrap_or(false);
 
@@ -153,7 +124,7 @@ impl Tool for GrepTool {
         cmd.arg("--max-columns").arg("500");
         cmd.arg("--max-columns-preview");
 
-        match output_mode {
+        match output_mode.as_str() {
             "files_with_matches" => {
                 cmd.arg("--files-with-matches");
                 cmd.arg("--sort=modified");
@@ -161,7 +132,7 @@ impl Tool for GrepTool {
             "count" => {
                 cmd.arg("--count");
             }
-            "content" | _ => {
+            _ => {
                 if show_line_numbers {
                     cmd.arg("--line-number");
                 }
@@ -184,11 +155,11 @@ impl Tool for GrepTool {
         if multiline {
             cmd.arg("-U").arg("--multiline-dotall");
         }
-        if let Some(ref glob_pat) = glob_filter {
-            cmd.arg("--glob").arg(glob_pat);
+        if let Some(ref g) = glob_filter {
+            cmd.arg("--glob").arg(g);
         }
-        if let Some(ref type_name) = type_filter {
-            cmd.arg("--type").arg(type_name);
+        if let Some(ref t) = type_filter {
+            cmd.arg("--type").arg(t);
         }
         if pattern.starts_with('-') {
             cmd.arg("-e");
@@ -198,22 +169,22 @@ impl Tool for GrepTool {
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        let output = tokio::time::timeout(
+        let output_res = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             cmd.output(),
         )
         .await;
 
-        let output = match output {
+        let output = match output_res {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => {
-                return Ok(ToolResult::error(format!(
+                return Ok(ToolOutput::error(format!(
                     "Search command failed: {e}. Is ripgrep (rg) installed?"
                 )));
             }
             Err(_) => {
-                return Ok(ToolResult::error(
-                    "Search timed out after 30 seconds. Try a more specific pattern or path.",
+                return Ok(ToolOutput::error(
+                    "Search timed out after 30s. Try a more specific pattern or path.",
                 ));
             }
         };
@@ -222,75 +193,139 @@ impl Tool for GrepTool {
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         if output.status.code() == Some(1) && stdout.is_empty() {
-            return Ok(ToolResult::success(format!(
-                "No matches found for pattern: {pattern}"
-            )));
+            return Ok(ToolOutput::empty(format!(
+                "No matches for {pattern:?}"
+            ))
+            .with_summary(format!("0 matches for {pattern:?}"))
+            .with_next_step("Broaden the regex, try case-insensitive (-i), or search a wider path"));
         }
 
         if !output.status.success() && output.status.code() != Some(1) {
-            return Ok(ToolResult::error(format!(
+            return Ok(ToolOutput::error(format!(
                 "Search failed: {}",
-                if stderr.is_empty() {
-                    "unknown error"
-                } else {
-                    stderr.trim()
-                }
+                if stderr.is_empty() { "unknown error" } else { stderr.trim() }
             )));
         }
 
-        let result = stdout.trim().to_string();
+        let result = relativize_paths(stdout.trim(), &context.cwd);
         if result.is_empty() {
-            return Ok(ToolResult::success(format!(
-                "No matches found for pattern: {pattern}"
+            return Ok(ToolOutput::empty(format!(
+                "No matches for {pattern:?}"
             )));
         }
 
-        // Relativize paths to save tokens
-        let result = relativize_paths(&result, &context.cwd);
-
-        // Apply offset + head_limit
-        let mut lines: Vec<&str> = result.lines().collect();
-        let total = lines.len();
-
-        // Apply offset first
-        if offset > 0 && offset < lines.len() {
-            lines = lines[offset..].to_vec();
-        } else if offset >= lines.len() {
-            return Ok(ToolResult::success(format!(
+        // Slice by offset + head_limit.
+        let all_lines: Vec<&str> = result.lines().collect();
+        let total = all_lines.len();
+        if offset >= total && total > 0 {
+            return Ok(ToolOutput::empty(format!(
                 "No results at offset {offset} (total: {total})"
             )));
         }
 
-        let was_limited = head_limit > 0 && lines.len() > head_limit;
-        if was_limited {
-            lines.truncate(head_limit);
-        }
-        let mut output_str = lines.join("\n");
+        let sliced = &all_lines[offset..];
+        let shown = if head_limit > 0 {
+            sliced.len().min(head_limit)
+        } else {
+            sliced.len()
+        };
+        let lines: Vec<&&str> = sliced.iter().take(shown).collect();
 
-        if was_limited || offset > 0 {
-            let showing = lines.len();
-            output_str.push_str(&format!(
-                "\n\n({showing} results shown, {total} total{})",
-                if offset > 0 { format!(", offset {offset}") } else { String::new() }
-            ));
+        // Build body depending on output_mode.
+        let body = match output_mode.as_str() {
+            "files_with_matches" => {
+                let rows: Vec<Vec<String>> =
+                    lines.iter().map(|l| vec![l.to_string()]).collect();
+                ToolBody::Toon(ToonValue::Map(vec![(
+                    "files".into(),
+                    ToonValue::Table {
+                        columns: vec!["path".into()],
+                        rows,
+                    },
+                )]))
+            }
+            "content" => {
+                // Try to split "file:line:text" into columns when line numbers are on.
+                if show_line_numbers {
+                    let rows: Vec<Vec<String>> = lines
+                        .iter()
+                        .map(|l| parse_content_line(l))
+                        .collect();
+                    ToolBody::Toon(ToonValue::Map(vec![(
+                        "matches".into(),
+                        ToonValue::Table {
+                            columns: vec!["file".into(), "line".into(), "text".into()],
+                            rows,
+                        },
+                    )]))
+                } else {
+                    ToolBody::Text(lines.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("\n"))
+                }
+            }
+            _ => ToolBody::Text(lines.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("\n")),
+        };
+
+        // Truncation bookkeeping: total minus offset is what was theoretically accessible.
+        let accessible = total - offset;
+        let was_truncated = !full && shown < accessible;
+
+        let mut summary_count = shown;
+        if output_mode == "count" {
+            // In count mode, `shown` is already a files count.
+            summary_count = shown;
+        }
+        let summary = match output_mode.as_str() {
+            "files_with_matches" => format!("{summary_count} file(s) with matches"),
+            "count" => format!("{summary_count} file(s) reported match counts"),
+            _ => format!("{summary_count} match line(s)"),
+        };
+
+        let mut out = ToolOutput::success().with_summary(summary).with_body(body);
+
+        if was_truncated {
+            out = out
+                .with_truncation(Truncation {
+                    shown,
+                    total: accessible,
+                    unit: "lines",
+                    how_to_see_more: "raise head_limit, bump offset, or pass full=true".into(),
+                })
+                .with_next_step("Pass full=true, or raise head_limit, or bump offset");
         }
 
-        // Final size guard
-        if output_str.len() > MAX_OUTPUT_CHARS {
-            let truncated =
-                crate::tools::path_safety::safe_truncate(&output_str, MAX_OUTPUT_CHARS);
-            output_str = format!(
-                "{}\n\n... (output truncated, {} total bytes)",
-                truncated,
-                output_str.len()
-            );
+        if output_mode != "files_with_matches" {
+            out = out.with_next_step("Switch output_mode=files_with_matches for a file list");
         }
 
-        Ok(ToolResult::success(output_str))
+        // Final safety cap against runaway payloads (very long lines).
+        let rendered = out.render();
+        if rendered.len() > MAX_OUTPUT_CHARS {
+            let safe =
+                crate::tools::path_safety::safe_truncate(&rendered, MAX_OUTPUT_CHARS);
+            return Ok(ToolOutput::success()
+                .with_summary(format!("Grep (bytes-capped): {} total bytes", rendered.len()))
+                .with_text(safe)
+                .with_truncation(Truncation {
+                    shown: MAX_OUTPUT_CHARS,
+                    total: rendered.len(),
+                    unit: "bytes",
+                    how_to_see_more: "narrow the regex or filter with glob/type".into(),
+                }));
+        }
+
+        Ok(out)
     }
 }
 
-/// Convert absolute paths to relative paths to save tokens.
+fn parse_content_line(line: &str) -> Vec<String> {
+    // Format typical: "file:line:text" but text may contain colons.
+    let mut parts = line.splitn(3, ':');
+    let file = parts.next().unwrap_or("").to_string();
+    let line_no = parts.next().unwrap_or("").to_string();
+    let text = parts.next().unwrap_or("").to_string();
+    vec![file, line_no, text]
+}
+
 fn relativize_paths(text: &str, cwd: &std::path::Path) -> String {
     let cwd_str = format!("{}/", cwd.display());
     text.replace(&cwd_str, "")

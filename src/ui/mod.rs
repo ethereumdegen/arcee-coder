@@ -12,6 +12,7 @@ use crate::config::{CliOverrides, Config};
 use crate::engine;
 use crate::engine::cost::CostTracker;
 use crate::messages::types::Message;
+use crate::provider::{arcee::ArceeProvider, Provider};
 use crate::session::Session;
 use crate::tools;
 use crate::tools::lsp::LspManager;
@@ -26,7 +27,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Build a ToolContext from the current config and shared state.
-fn build_tool_context(config: &Config, api_client: Arc<crate::api::ApiClient>) -> ToolContext {
+fn build_tool_context(config: &Config, provider: Arc<dyn Provider>) -> ToolContext {
     ToolContext {
         cwd: config.cwd.clone(),
         permission_mode: Arc::new(Mutex::new(config.permission_mode)),
@@ -34,7 +35,7 @@ fn build_tool_context(config: &Config, api_client: Arc<crate::api::ApiClient>) -
         background_tasks: Arc::new(Mutex::new(
             crate::tools::background_tasks::BackgroundTaskStore::new(),
         )),
-        api_client,
+        provider,
         config: config.clone(),
         lsp_manager: Arc::new(Mutex::new(LspManager::new())),
         plan_file_path: Arc::new(Mutex::new(None)),
@@ -88,8 +89,9 @@ pub async fn run_repl(mut config: Config, overrides: &CliOverrides, resume_sessi
     // Fetch dynamic pricing from the API
     fetch_pricing(&client, &mut config).await;
 
+    let provider: Arc<dyn Provider> = Arc::new(ArceeProvider::new(client.clone()));
     let tool_registry = tools::build_default_registry();
-    let tool_context = build_tool_context(&config, client.clone());
+    let tool_context = build_tool_context(&config, provider.clone());
 
     // Restore session state if resuming, otherwise start fresh
     let (mut messages, mut cost_tracker, mut session) = if let Some(s) = resume_session {
@@ -184,7 +186,7 @@ pub async fn run_repl(mut config: Config, overrides: &CliOverrides, resume_sessi
 
         // Handle slash commands
         if input.starts_with('/') {
-            match commands::handle_command(&input, &mut messages, &cost_tracker, &mut config, &client).await {
+            match commands::handle_command(&input, &mut messages, &cost_tracker, &mut config, provider.as_ref()).await {
                 commands::CommandResult::Output(text) => {
                     bridge.status(&text, StatusLevel::Info);
                     continue;
@@ -216,7 +218,7 @@ pub async fn run_repl(mut config: Config, overrides: &CliOverrides, resume_sessi
         escape_flag.store(false, Ordering::Relaxed);
 
         if let Err(e) = engine::query_loop(
-            &client,
+            provider.as_ref(),
             &mut messages,
             &tool_registry,
             &config,
@@ -364,8 +366,9 @@ pub async fn run_oneshot(mut config: Config, prompt: &str, overrides: &CliOverri
 
     fetch_pricing(&client, &mut config).await;
 
+    let provider: Arc<dyn Provider> = Arc::new(ArceeProvider::new(client.clone()));
     let tool_registry = tools::build_default_registry();
-    let tool_context = build_tool_context(&config, client.clone());
+    let tool_context = build_tool_context(&config, provider.clone());
     let mut messages = vec![Message::user_text(prompt)];
     let mut cost_tracker = CostTracker::with_pricing(config.pricing_table.clone());
 
@@ -377,7 +380,7 @@ pub async fn run_oneshot(mut config: Config, prompt: &str, overrides: &CliOverri
     let escape_flag = Arc::new(AtomicBool::new(false));
     let _guard = spawn_escape_listener(&escape_flag);
     engine::query_loop(
-        &client,
+        provider.as_ref(),
         &mut messages,
         &tool_registry,
         &config,

@@ -1,2 +1,7 @@
 target
 .env
+test-repo/**/.env
+test-repo/**/node_modules/
+test-repo/**/target/
+test-repo/**/dist/
+test-tmp/

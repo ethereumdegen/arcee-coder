@@ -1,76 +1,64 @@
 use crate::tools::task_store::TaskStatus;
-use crate::tools::{Tool, ToolContext, ToolResult};
+use crate::tools::{PermissionClass, Tool, ToolContext, ToolOutput};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
+use std::sync::OnceLock;
 
 pub struct TaskUpdateTool;
 
-#[async_trait]
-impl Tool for TaskUpdateTool {
-    fn name(&self) -> &str {
-        "TaskUpdate"
-    }
+const DESCRIPTION: &str = "Use this tool to update a task in the task list.\n\n\
+## When to Use This Tool\n\n\
+**Mark tasks as resolved:**\n\
+- When you have completed the work described in a task\n\
+- When a task is no longer needed or has been superseded\n\
+- IMPORTANT: Always mark your assigned tasks as resolved when you finish them\n\
+- After resolving, call TaskList to find your next task\n\n\
+- ONLY mark a task as completed when you have FULLY accomplished it\n\
+- If you encounter errors, blockers, or cannot finish, keep the task as in_progress\n\
+- When blocked, create a new task describing what needs to be resolved\n\
+- Never mark a task as completed if:\n\
+  - Tests are failing\n\
+  - Implementation is partial\n\
+  - You encountered unresolved errors\n\
+  - You couldn't find necessary files or dependencies\n\n\
+**Delete tasks:**\n\
+- When a task is no longer relevant or was created in error\n\
+- Setting status to `deleted` permanently removes the task\n\n\
+**Update task details:**\n\
+- When requirements change or become clearer\n\
+- When establishing dependencies between tasks\n\n\
+## Fields You Can Update\n\n\
+- **status**: The task status (see Status Workflow below)\n\
+- **subject**: Change the task title (imperative form, e.g., \"Run tests\")\n\
+- **description**: Change the task description\n\
+- **activeForm**: Present continuous form shown in spinner when in_progress (e.g., \"Running tests\")\n\
+- **owner**: Change the task owner (agent name)\n\
+- **metadata**: Merge metadata keys into the task (set a key to null to delete it)\n\
+- **addBlocks**: Mark tasks that cannot start until this one completes\n\
+- **addBlockedBy**: Mark tasks that must complete before this one can start\n\n\
+## Status Workflow\n\n\
+Status progresses: `pending` → `in_progress` → `completed`\n\n\
+Use `deleted` to permanently remove a task.\n\n\
+## Staleness\n\n\
+Make sure to read a task's latest state using `TaskGet` before updating it.";
 
-    fn description(&self) -> String {
-        r#"Use this tool to update a task in the task list.
-
-## When to Use This Tool
-
-**Mark tasks as in_progress:**
-- When you START working on a task, mark it in_progress BEFORE beginning work
-
-**Mark tasks as completed:**
-- When you have FULLY completed the work described in a task
-- IMPORTANT: Always mark your tasks as completed when you finish them
-- After completing, call TaskList to find your next task
-
-- ONLY mark a task as completed when you have FULLY accomplished it
-- If you encounter errors, blockers, or cannot finish, keep the task as in_progress
-- When blocked, create a new task describing what needs to be resolved
-- Never mark a task as completed if:
-  - Tests are failing
-  - Implementation is partial
-  - You encountered unresolved errors
-
-**Delete tasks:**
-- When a task is no longer relevant or was created in error
-
-## Status Workflow
-
-Status progresses: `pending` → `in_progress` → `completed`
-Use `deleted` to permanently remove a task."#
-            .to_string()
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
+fn schema() -> &'static serde_json::Value {
+    static CELL: OnceLock<serde_json::Value> = OnceLock::new();
+    CELL.get_or_init(|| {
         json!({
             "type": "object",
             "properties": {
-                "taskId": {
-                    "type": "string",
-                    "description": "The ID of the task to update"
-                },
+                "taskId": { "type": "string", "description": "The ID of the task to update" },
                 "status": {
                     "type": "string",
-                    "description": "New status: pending, in_progress, completed, or deleted"
+                    "description": "New status",
+                    "enum": ["pending", "in_progress", "completed", "deleted"]
                 },
-                "subject": {
-                    "type": "string",
-                    "description": "New subject/title for the task"
-                },
-                "description": {
-                    "type": "string",
-                    "description": "New description for the task"
-                },
-                "activeForm": {
-                    "type": "string",
-                    "description": "Present continuous form for spinner display"
-                },
-                "owner": {
-                    "type": "string",
-                    "description": "New owner for the task"
-                },
+                "subject": { "type": "string", "description": "New subject/title" },
+                "description": { "type": "string", "description": "New description" },
+                "activeForm": { "type": "string", "description": "Present continuous form" },
+                "owner": { "type": "string", "description": "New owner" },
                 "addBlocks": {
                     "type": "array",
                     "description": "Task IDs that this task blocks",
@@ -83,18 +71,33 @@ Use `deleted` to permanently remove a task."#
                 },
                 "metadata": {
                     "type": "object",
-                    "description": "Metadata keys to merge into the task"
+                    "description": "Metadata keys to merge (null to delete a key)"
                 }
             },
             "required": ["taskId"]
         })
+    })
+}
+
+#[async_trait]
+impl Tool for TaskUpdateTool {
+    fn name(&self) -> &'static str {
+        "TaskUpdate"
     }
 
-    fn is_read_only(&self, _input: &serde_json::Value) -> bool {
-        true // Task management doesn't need permission
+    fn description(&self) -> &'static str {
+        DESCRIPTION
     }
 
-    async fn call(&self, input: serde_json::Value, context: &ToolContext) -> Result<ToolResult> {
+    fn input_schema(&self) -> &'static serde_json::Value {
+        schema()
+    }
+
+    fn permission(&self, _input: &serde_json::Value) -> PermissionClass {
+        PermissionClass::ReadOnly
+    }
+
+    async fn call(&self, input: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
         let task_id = input["taskId"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'taskId' parameter"))?;
@@ -105,16 +108,18 @@ Use `deleted` to permanently remove a task."#
         if let Some(status_str) = input["status"].as_str() {
             if status_str == "deleted" {
                 if store.delete(task_id) {
-                    return Ok(ToolResult::success(format!("Task #{task_id} deleted")));
+                    return Ok(ToolOutput::success()
+                        .with_summary(format!("Task #{task_id} deleted"))
+                        .with_text(format!("Task #{task_id} was removed.")));
                 } else {
-                    return Ok(ToolResult::error(format!("Task #{task_id} not found")));
+                    return Ok(ToolOutput::error(format!("Task #{task_id} not found")));
                 }
             }
         }
 
         let task = match store.get_mut(task_id) {
             Some(t) => t,
-            None => return Ok(ToolResult::error(format!("Task #{task_id} not found"))),
+            None => return Ok(ToolOutput::error(format!("Task #{task_id} not found"))),
         };
 
         let mut changes = Vec::new();
@@ -124,7 +129,7 @@ Use `deleted` to permanently remove a task."#
                 task.status = status;
                 changes.push(format!("status → {status_str}"));
             } else {
-                return Ok(ToolResult::error(format!(
+                return Ok(ToolOutput::error(format!(
                     "Invalid status '{status_str}'. Must be: pending, in_progress, completed, or deleted"
                 )));
             }
@@ -184,14 +189,16 @@ Use `deleted` to permanently remove a task."#
         }
 
         if changes.is_empty() {
-            return Ok(ToolResult::success(format!(
+            return Ok(ToolOutput::empty(format!(
                 "No changes applied to task #{task_id}"
             )));
         }
 
-        Ok(ToolResult::success(format!(
-            "Updated task #{task_id} {}",
-            changes.join(", ")
-        )))
+        Ok(ToolOutput::success()
+            .with_summary(format!("Task #{task_id} updated"))
+            .with_text(format!(
+                "Updated task #{task_id}: {}",
+                changes.join(", ")
+            )))
     }
 }

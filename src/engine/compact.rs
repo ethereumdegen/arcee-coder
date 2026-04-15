@@ -1,7 +1,7 @@
-use crate::api::client::ApiClient;
 use crate::api::types::ContentBlock;
 use crate::messages::normalize::normalize_for_api;
 use crate::messages::types::*;
+use crate::provider::{Provider, ProviderEvent, ProviderRequest};
 
 /// Estimate token count from text (rough heuristic: ~3.8 chars per token).
 pub fn estimate_tokens(messages: &[Message]) -> u64 {
@@ -141,7 +141,7 @@ Do NOT be vague. Output ONLY the summary, no preamble.";
 /// Compact messages using AI summarization, with fallback to truncation.
 /// Returns the compacted message list.
 pub async fn compact_messages_ai(
-    client: &ApiClient,
+    provider: &dyn Provider,
     model: &str,
     messages: &[Message],
     keep_recent: usize,
@@ -167,7 +167,7 @@ pub async fn compact_messages_ai(
     );
 
     // Try AI summarization
-    let summary = match summarize_with_api(client, model, &summary_request).await {
+    let summary = match summarize_with_api(provider, model, &summary_request).await {
         Ok(s) if !s.trim().is_empty() => {
             format!(
                 "[Context compacted — {} earlier messages summarized by AI]\n\n{}",
@@ -193,9 +193,9 @@ pub async fn compact_messages_ai(
     compacted
 }
 
-/// Call the API to generate a summary of the conversation.
+/// Call the provider to generate a summary of the conversation.
 async fn summarize_with_api(
-    client: &ApiClient,
+    provider: &dyn Provider,
     model: &str,
     content: &str,
 ) -> Result<String, String> {
@@ -206,28 +206,29 @@ async fn summarize_with_api(
     let api_messages = normalize_for_api(&messages);
 
     let mut result_text = String::new();
-    let mut noop_text = |text: &str| {
-        result_text.push_str(text);
+    let mut on_event = |event: ProviderEvent| {
+        if let ProviderEvent::TextDelta(text) = event {
+            result_text.push_str(&text);
+        }
     };
-    let mut noop_tool = |_id: &str, _name: &str| {};
 
-    let (content_blocks, _stop, _usage) = client
-        .send_message_with_model(
-            model,
-            COMPACT_SYSTEM_PROMPT,
-            api_messages,
-            vec![], // no tools
-            4096,   // enough for a summary
-            &mut noop_text,
-            &mut noop_tool,
-            None, // no escape flag
-        )
+    let request = ProviderRequest {
+        model: model.to_string(),
+        system: COMPACT_SYSTEM_PROMPT.to_string(),
+        messages: api_messages,
+        tools: vec![],
+        max_tokens: 4096,
+        thinking_budget: None,
+    };
+
+    let response = provider
+        .stream_message(request, &mut on_event, None)
         .await
         .map_err(|e| format!("{e}"))?;
 
     // Extract text from response
     let mut summary = String::new();
-    for block in content_blocks {
+    for block in response.content {
         if let ContentBlock::Text { text } = block {
             summary.push_str(&text);
         }

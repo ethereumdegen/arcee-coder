@@ -1,29 +1,23 @@
-use crate::tools::{Tool, ToolContext, ToolResult};
+use crate::tools::background_tasks::{BackgroundTask, BackgroundTaskStatus};
+use crate::tools::{PermissionClass, Tool, ToolContext, ToolOutput};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
+use std::sync::OnceLock;
 
 pub struct TaskOutputTool;
 
-#[async_trait]
-impl Tool for TaskOutputTool {
-    fn name(&self) -> &str {
-        "TaskOutput"
-    }
+const DESCRIPTION: &str = "- Retrieves output from a running or completed task (background shell, agent, or remote session)\n\
+- Takes a task_id parameter identifying the task\n\
+- Returns the task output along with status information\n\
+- Use block=true (default) to wait for task completion\n\
+- Use block=false for non-blocking check of current status\n\
+- Task IDs can be found using the /tasks command\n\
+- Works with all task types: background shells, async agents, and remote sessions";
 
-    fn description(&self) -> String {
-        r#"Retrieve output from a background agent task.
-
-- Takes a task_id parameter identifying the background task
-- Returns the task output along with status information
-- Use block=true (default) to wait for task completion
-- Use block=false for non-blocking check of current status
-- Task IDs are returned when launching agents with run_in_background=true
-- You will be automatically notified when background tasks complete — prefer waiting for the notification over polling"#
-            .to_string()
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
+fn schema() -> &'static serde_json::Value {
+    static CELL: OnceLock<serde_json::Value> = OnceLock::new();
+    CELL.get_or_init(|| {
         json!({
             "type": "object",
             "properties": {
@@ -33,66 +27,93 @@ impl Tool for TaskOutputTool {
                 },
                 "block": {
                     "type": "boolean",
-                    "description": "Whether to wait for completion (default: true). Set to false for non-blocking status check."
+                    "default": true,
+                    "description": "Whether to wait for completion"
+                },
+                "timeout": {
+                    "type": "number",
+                    "default": 30000,
+                    "description": "Max wait time in ms",
+                    "minimum": 0,
+                    "maximum": 600000
                 }
             },
-            "required": ["task_id"]
+            "required": ["task_id", "block", "timeout"]
         })
+    })
+}
+
+#[async_trait]
+impl Tool for TaskOutputTool {
+    fn name(&self) -> &'static str {
+        "TaskOutput"
     }
 
-    fn is_read_only(&self, _input: &serde_json::Value) -> bool {
-        true
+    fn description(&self) -> &'static str {
+        DESCRIPTION
     }
 
-    async fn call(&self, input: serde_json::Value, context: &ToolContext) -> Result<ToolResult> {
+    fn input_schema(&self) -> &'static serde_json::Value {
+        schema()
+    }
+
+    fn permission(&self, _input: &serde_json::Value) -> PermissionClass {
+        PermissionClass::ReadOnly
+    }
+
+    async fn call(&self, input: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
         let task_id = input["task_id"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'task_id' parameter"))?;
         let block = input["block"].as_bool().unwrap_or(true);
 
         if block {
-            // Wait for completion with a timeout
-            let timeout = std::time::Duration::from_secs(300); // 5 min max
+            let timeout = std::time::Duration::from_secs(300);
             let start = std::time::Instant::now();
             loop {
                 {
                     let bg = context.background_tasks.lock().await;
                     if let Some(task) = bg.get(task_id) {
-                        if task.status != crate::tools::background_tasks::BackgroundTaskStatus::Running {
-                            return Ok(format_task_result(task));
+                        if task.status != BackgroundTaskStatus::Running {
+                            return Ok(format_task_output(task));
                         }
                     } else {
-                        return Ok(ToolResult::error(format!(
+                        return Ok(ToolOutput::error(format!(
                             "No background task found with id '{task_id}'"
                         )));
                     }
                 }
                 if start.elapsed() > timeout {
-                    return Ok(ToolResult::error(format!(
+                    return Ok(ToolOutput::error(format!(
                         "Timed out waiting for background task #{task_id} to complete"
                     )));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         } else {
-            // Non-blocking check
             let bg = context.background_tasks.lock().await;
-            if let Some(task) = bg.get(task_id) {
-                Ok(format_task_result(task))
-            } else {
-                Ok(ToolResult::error(format!(
+            match bg.get(task_id) {
+                Some(task) => Ok(format_task_output(task)),
+                None => Ok(ToolOutput::error(format!(
                     "No background task found with id '{task_id}'"
-                )))
+                ))),
             }
         }
     }
 }
 
-fn format_task_result(task: &crate::tools::background_tasks::BackgroundTask) -> ToolResult {
+fn format_task_output(task: &BackgroundTask) -> ToolOutput {
     let elapsed = match task.completed_at {
         Some(end) => end.duration_since(task.started_at),
         None => task.started_at.elapsed(),
     };
+
+    let summary = format!(
+        "task #{} [{}] {:.1}s",
+        task.id,
+        task.status.as_str(),
+        elapsed.as_secs_f64()
+    );
 
     match &task.result {
         Some(result) => {
@@ -103,14 +124,23 @@ fn format_task_result(task: &crate::tools::background_tasks::BackgroundTask) -> 
                 task.description,
                 elapsed.as_secs_f64()
             );
-            ToolResult::success(format!("{header}{result}"))
+            let mut out = ToolOutput::success()
+                .with_summary(summary)
+                .with_text(format!("{header}{result}"));
+            if task.status == BackgroundTaskStatus::Failed {
+                out.is_error = true;
+            }
+            out
         }
-        None => ToolResult::success(format!(
-            "Background task #{} [{}] — {} ({:.1}s elapsed, still running)",
-            task.id,
-            task.status.as_str(),
-            task.description,
-            elapsed.as_secs_f64()
-        )),
+        None => ToolOutput::success()
+            .with_summary(summary)
+            .with_text(format!(
+                "Background task #{} [{}] — {} ({:.1}s elapsed, still running)",
+                task.id,
+                task.status.as_str(),
+                task.description,
+                elapsed.as_secs_f64()
+            ))
+            .with_next_step("Wait for the completion notification, or call again with block=true"),
     }
 }

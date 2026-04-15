@@ -1,9 +1,10 @@
-use crate::tools::{Tool, ToolContext, ToolResult};
+use crate::tools::{PermissionClass, Tool, ToolContext, ToolOutput};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
@@ -297,27 +298,32 @@ fn path_to_uri(path: &Path) -> String {
 
 pub struct LspTool;
 
-#[async_trait]
-impl Tool for LspTool {
-    fn name(&self) -> &str {
-        "LSP"
-    }
+const LSP_DESCRIPTION: &str = "Interact with Language Server Protocol (LSP) servers for code intelligence.\n\n\
+REQUIRED: \"operation\", \"filePath\", \"line\" (1-based), \"character\" (1-based).\n\n\
+Operations: goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, \
+goToImplementation, prepareCallHierarchy, incomingCalls, outgoingCalls.\n\n\
+Supported languages: Rust (.rs), TypeScript/JavaScript (.ts/.tsx/.js/.jsx), Python (.py), Go (.go).";
 
-    fn description(&self) -> String {
-        "Interact with Language Server Protocol servers for code intelligence. \
-         Supports: goToDefinition, findReferences, hover, documentSymbol, \
-         workspaceSymbol, goToImplementation, prepareCallHierarchy, \
-         incomingCalls, outgoingCalls."
-            .to_string()
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
+fn lsp_schema() -> &'static serde_json::Value {
+    static CELL: OnceLock<serde_json::Value> = OnceLock::new();
+    CELL.get_or_init(|| {
         json!({
             "type": "object",
             "properties": {
                 "operation": {
                     "type": "string",
-                    "description": "LSP operation: goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, goToImplementation, prepareCallHierarchy, incomingCalls, outgoingCalls"
+                    "description": "LSP operation",
+                    "enum": [
+                        "goToDefinition",
+                        "findReferences",
+                        "hover",
+                        "documentSymbol",
+                        "workspaceSymbol",
+                        "goToImplementation",
+                        "prepareCallHierarchy",
+                        "incomingCalls",
+                        "outgoingCalls"
+                    ]
                 },
                 "filePath": {
                     "type": "string",
@@ -334,13 +340,28 @@ impl Tool for LspTool {
             },
             "required": ["operation", "filePath", "line", "character"]
         })
+    })
+}
+
+#[async_trait]
+impl Tool for LspTool {
+    fn name(&self) -> &'static str {
+        "LSP"
     }
 
-    fn is_read_only(&self, _input: &serde_json::Value) -> bool {
-        true
+    fn description(&self) -> &'static str {
+        LSP_DESCRIPTION
     }
 
-    async fn call(&self, input: serde_json::Value, context: &ToolContext) -> Result<ToolResult> {
+    fn input_schema(&self) -> &'static serde_json::Value {
+        lsp_schema()
+    }
+
+    fn permission(&self, _input: &serde_json::Value) -> PermissionClass {
+        PermissionClass::ReadOnly
+    }
+
+    async fn call(&self, input: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
         let operation = input["operation"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'operation' parameter"))?;
@@ -370,14 +391,14 @@ impl Tool for LspTool {
         let server = match lsp_manager.get_server(extension, &context.cwd).await {
             Ok(Some(s)) => s,
             Ok(None) => {
-                return Ok(ToolResult::error(format!(
+                return Ok(ToolOutput::error(format!(
                     "No LSP server available for .{extension} files. \
                      Supported: .rs (rust-analyzer), .ts/.js (typescript-language-server), \
                      .py (pylsp), .go (gopls)"
                 )));
             }
             Err(e) => {
-                return Ok(ToolResult::error(format!(
+                return Ok(ToolOutput::error(format!(
                     "Failed to start LSP server for .{extension}: {e}"
                 )));
             }
@@ -403,7 +424,7 @@ impl Tool for LspTool {
             .ensure_document_open(&file_uri, extension_to_language_id(extension), &content)
             .await
         {
-            return Ok(ToolResult::error(format!(
+            return Ok(ToolOutput::error(format!(
                 "Failed to open document in LSP server: {e}"
             )));
         }
@@ -494,7 +515,7 @@ impl Tool for LspTool {
                 }
             }
             _ => {
-                return Ok(ToolResult::error(format!(
+                return Ok(ToolOutput::error(format!(
                     "Unknown LSP operation '{operation}'. Supported: goToDefinition, \
                      findReferences, hover, documentSymbol, workspaceSymbol, \
                      goToImplementation, prepareCallHierarchy, incomingCalls, outgoingCalls"
@@ -505,9 +526,11 @@ impl Tool for LspTool {
         match result {
             Ok(value) => {
                 let formatted = format_lsp_result(operation, &value);
-                Ok(ToolResult::success(formatted))
+                Ok(ToolOutput::success()
+                    .with_summary(format!("LSP {operation}"))
+                    .with_text(formatted))
             }
-            Err(e) => Ok(ToolResult::error(format!("LSP request failed: {e}"))),
+            Err(e) => Ok(ToolOutput::error(format!("LSP request failed: {e}"))),
         }
     }
 }

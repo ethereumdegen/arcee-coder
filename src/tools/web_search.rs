@@ -1,23 +1,32 @@
-use crate::tools::{Tool, ToolContext, ToolResult};
+use crate::toon::ToonValue;
+use crate::tools::{PermissionClass, Tool, ToolBody, ToolContext, ToolOutput, Truncation};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
+use std::sync::OnceLock;
 
 pub struct WebSearchTool;
 
-#[async_trait]
-impl Tool for WebSearchTool {
-    fn name(&self) -> &str {
-        "WebSearch"
-    }
+const DEFAULT_LIMIT: usize = 10;
+const FULL_LIMIT: usize = 25;
 
-    fn description(&self) -> String {
-        "Search the web and return results. Uses Brave Search API if BRAVE_API_KEY is set, \
-         otherwise falls back to DuckDuckGo (no key required)."
-            .to_string()
-    }
+const DESCRIPTION: &str = "\
+- Allows Claude to search the web and use the results to inform responses\n\
+- Provides up-to-date information for current events and recent data\n\
+- Returns search result information formatted as search result blocks, including links as markdown hyperlinks\n\
+- Use this tool for accessing information beyond Claude's knowledge cutoff\n\
+- Searches are performed automatically within a single API call\n\n\
+CRITICAL REQUIREMENT - You MUST follow this:\n\
+  - After answering the user's question, you MUST include a \"Sources:\" section at the end of your response\n\
+  - In the Sources section, list all relevant URLs from the search results as markdown hyperlinks: [Title](URL)\n\
+  - This is MANDATORY - never skip including sources in your response\n\n\
+Usage notes:\n\
+  - Domain filtering is supported to include or block specific websites\n\
+  - Uses Brave Search API when BRAVE_API_KEY / ARCEE_SEARCH_API_KEY is set, otherwise falls back to DuckDuckGo (no key required)";
 
-    fn input_schema(&self) -> serde_json::Value {
+fn schema() -> &'static serde_json::Value {
+    static CELL: OnceLock<serde_json::Value> = OnceLock::new();
+    CELL.get_or_init(|| {
         json!({
             "type": "object",
             "properties": {
@@ -34,26 +43,46 @@ impl Tool for WebSearchTool {
                     "type": "array",
                     "description": "Exclude results from these domains",
                     "items": { "type": "string" }
+                },
+                "full": {
+                    "type": "boolean",
+                    "description": "Return up to 25 results instead of the default 10"
                 }
             },
             "required": ["query"]
         })
+    })
+}
+
+#[async_trait]
+impl Tool for WebSearchTool {
+    fn name(&self) -> &'static str {
+        "WebSearch"
     }
 
-    fn is_read_only(&self, _input: &serde_json::Value) -> bool {
-        true
+    fn description(&self) -> &'static str {
+        DESCRIPTION
     }
 
-    async fn call(&self, input: serde_json::Value, _context: &ToolContext) -> Result<ToolResult> {
+    fn input_schema(&self) -> &'static serde_json::Value {
+        schema()
+    }
+
+    fn permission(&self, _input: &serde_json::Value) -> PermissionClass {
+        PermissionClass::ReadOnly
+    }
+
+    async fn call(&self, input: serde_json::Value, _context: &ToolContext) -> Result<ToolOutput> {
         let query = input["query"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'query' parameter"))?;
 
         if query.len() < 2 {
-            return Ok(ToolResult::error(
-                "Query must be at least 2 characters long",
-            ));
+            return Ok(ToolOutput::error("Query must be at least 2 characters long"));
         }
+
+        let full = input["full"].as_bool().unwrap_or(false);
+        let limit = if full { FULL_LIMIT } else { DEFAULT_LIMIT };
 
         let allowed_domains: Vec<String> = input["allowed_domains"]
             .as_array()
@@ -73,7 +102,6 @@ impl Tool for WebSearchTool {
             })
             .unwrap_or_default();
 
-        // Build search query with domain filters
         let mut search_query = query.to_string();
         for domain in &allowed_domains {
             search_query.push_str(&format!(" site:{domain}"));
@@ -82,21 +110,89 @@ impl Tool for WebSearchTool {
             search_query.push_str(&format!(" -site:{domain}"));
         }
 
-        // Try Brave if key is available, otherwise use DuckDuckGo
         let brave_key = std::env::var("BRAVE_API_KEY")
             .or_else(|_| std::env::var("ARCEE_SEARCH_API_KEY"))
             .ok();
 
-        if let Some(api_key) = brave_key {
-            search_brave(&search_query, &api_key, query).await
+        let raw_results: Result<Vec<SearchResult>> = if let Some(api_key) = brave_key {
+            search_brave(&search_query, &api_key, limit).await
         } else {
-            search_ddg(&search_query, query).await
+            search_ddg(&search_query, limit).await
+        };
+
+        let results = match raw_results {
+            Ok(r) => r,
+            Err(e) => return Ok(ToolOutput::error(format!("Search failed: {e}"))),
+        };
+
+        if results.is_empty() {
+            return Ok(ToolOutput::empty(format!("No results found for: {query}"))
+                .with_summary(format!("0 results for {query:?}"))
+                .with_next_step("Broaden the query or remove domain filters"));
         }
+
+        let total = results.len();
+        let shown_count = total.min(limit);
+        let rows: Vec<Vec<String>> = results
+            .iter()
+            .take(shown_count)
+            .map(|r| {
+                vec![
+                    r.title.clone(),
+                    r.url.clone(),
+                    truncate_snippet(&r.snippet, 200),
+                ]
+            })
+            .collect();
+
+        let body = ToolBody::Toon(ToonValue::Map(vec![(
+            "results".into(),
+            ToonValue::Table {
+                columns: vec!["title".into(), "url".into(), "snippet".into()],
+                rows,
+            },
+        )]));
+
+        let summary = format!("{shown_count} result(s) for {query:?}");
+        let mut out = ToolOutput::success().with_summary(summary).with_body(body);
+
+        if !full && total > DEFAULT_LIMIT {
+            out = out
+                .with_truncation(Truncation {
+                    shown: shown_count,
+                    total,
+                    unit: "results",
+                    how_to_see_more: "pass full=true for up to 25 results".into(),
+                })
+                .with_next_step("Pass full=true for up to 25 results");
+        }
+
+        out = out.with_next_step("Refine with site:<domain> or -site:<domain> to narrow further");
+
+        Ok(out)
     }
 }
 
-/// Search using Brave Search API (requires API key).
-async fn search_brave(search_query: &str, api_key: &str, display_query: &str) -> Result<ToolResult> {
+struct SearchResult {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+fn truncate_snippet(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.replace('\n', " ").trim().to_string()
+    } else {
+        let truncated: String = s.chars().take(max).collect();
+        format!("{}…", truncated.replace('\n', " ").trim())
+    }
+}
+
+async fn search_brave(
+    search_query: &str,
+    api_key: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
@@ -106,61 +202,33 @@ async fn search_brave(search_query: &str, api_key: &str, display_query: &str) ->
         .header("Accept", "application/json")
         .header("Accept-Encoding", "gzip")
         .header("X-Subscription-Token", api_key)
-        .query(&[("q", search_query), ("count", "10")])
+        .query(&[
+            ("q", search_query.to_string()),
+            ("count", limit.to_string()),
+        ])
         .send()
-        .await;
-
-    let response = match response {
-        Ok(r) => r,
-        Err(e) => {
-            return Ok(ToolResult::error(format!("Search request failed: {e}")));
-        }
-    };
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Ok(ToolResult::error(format!(
-            "Search API returned HTTP {status}: {body}"
-        )));
+        anyhow::bail!("Brave API HTTP {status}: {body}");
     }
 
-    let body: serde_json::Value = match response.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            return Ok(ToolResult::error(format!(
-                "Failed to parse search response: {e}"
-            )));
-        }
-    };
+    let body: serde_json::Value = response.json().await?;
+    let items = body["web"]["results"].as_array().cloned().unwrap_or_default();
 
-    let results = body["web"]["results"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-
-    if results.is_empty() {
-        return Ok(ToolResult::success(format!(
-            "No results found for: {display_query}"
-        )));
-    }
-
-    let mut output = format!("Search results for: {display_query}\n\n");
-    for (i, result) in results.iter().enumerate() {
-        let title = result["title"].as_str().unwrap_or("(no title)");
-        let url = result["url"].as_str().unwrap_or("");
-        let description = result["description"].as_str().unwrap_or("");
-        output.push_str(&format!(
-            "{}. **{}**\n   {}\n   {}\n\n",
-            i + 1, title, url, description
-        ));
-    }
-
-    Ok(ToolResult::success(output))
+    Ok(items
+        .into_iter()
+        .map(|r| SearchResult {
+            title: r["title"].as_str().unwrap_or("(no title)").to_string(),
+            url: r["url"].as_str().unwrap_or("").to_string(),
+            snippet: r["description"].as_str().unwrap_or("").to_string(),
+        })
+        .collect())
 }
 
-/// Search using DuckDuckGo HTML (no API key required).
-async fn search_ddg(search_query: &str, display_query: &str) -> Result<ToolResult> {
+async fn search_ddg(search_query: &str, limit: usize) -> Result<Vec<SearchResult>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
@@ -170,81 +238,44 @@ async fn search_ddg(search_query: &str, display_query: &str) -> Result<ToolResul
         .header("User-Agent", "Mozilla/5.0 (compatible; ArceeCode/1.0)")
         .query(&[("q", search_query)])
         .send()
-        .await;
-
-    let response = match response {
-        Ok(r) => r,
-        Err(e) => {
-            return Ok(ToolResult::error(format!("Search request failed: {e}")));
-        }
-    };
+        .await?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        return Ok(ToolResult::error(format!(
-            "DuckDuckGo returned HTTP {status}"
-        )));
+        anyhow::bail!("DuckDuckGo HTTP {}", response.status());
     }
 
-    let html = match response.text().await {
-        Ok(t) => t,
-        Err(e) => {
-            return Ok(ToolResult::error(format!(
-                "Failed to read search response: {e}"
-            )));
-        }
-    };
-
-    // Parse DuckDuckGo HTML results
-    let results = parse_ddg_html(&html);
-
-    if results.is_empty() {
-        return Ok(ToolResult::success(format!(
-            "No results found for: {display_query}"
-        )));
-    }
-
-    let mut output = format!("Search results for: {display_query}\n\n");
-    for (i, (title, url, snippet)) in results.iter().enumerate().take(10) {
-        output.push_str(&format!(
-            "{}. **{}**\n   {}\n   {}\n\n",
-            i + 1, title, url, snippet
-        ));
-    }
-
-    Ok(ToolResult::success(output))
+    let html = response.text().await?;
+    let results = parse_ddg_html(&html, limit);
+    Ok(results
+        .into_iter()
+        .map(|(title, url, snippet)| SearchResult {
+            title,
+            url,
+            snippet,
+        })
+        .collect())
 }
 
-/// Parse DuckDuckGo HTML search results page.
-fn parse_ddg_html(html: &str) -> Vec<(String, String, String)> {
+fn parse_ddg_html(html: &str, limit: usize) -> Vec<(String, String, String)> {
     let mut results = Vec::new();
 
-    // DuckDuckGo HTML results have class="result__a" for links and class="result__snippet" for snippets
-    // We do simple string parsing to avoid adding an HTML parser dependency.
     for block in html.split("class=\"result__body") {
-        if results.len() >= 10 {
+        if results.len() >= limit {
             break;
         }
 
-        // Extract title and URL from result__a link
         let (title, url) = if let Some(link_start) = block.find("class=\"result__a\"") {
             let after_link = &block[link_start..];
-
-            // Get href
             let href = if let Some(href_start) = after_link.find("href=\"") {
                 let href_content = &after_link[href_start + 6..];
                 if let Some(href_end) = href_content.find('"') {
-                    let raw_url = &href_content[..href_end];
-                    // DDG wraps URLs; extract the actual URL from redirect
-                    extract_ddg_url(raw_url)
+                    extract_ddg_url(&href_content[..href_end])
                 } else {
                     String::new()
                 }
             } else {
                 String::new()
             };
-
-            // Get title text (between > and </a>)
             let title = if let Some(tag_end) = after_link.find('>') {
                 let after_tag = &after_link[tag_end + 1..];
                 if let Some(close) = after_tag.find("</a>") {
@@ -255,7 +286,6 @@ fn parse_ddg_html(html: &str) -> Vec<(String, String, String)> {
             } else {
                 String::new()
             };
-
             (title, href)
         } else {
             continue;
@@ -265,7 +295,6 @@ fn parse_ddg_html(html: &str) -> Vec<(String, String, String)> {
             continue;
         }
 
-        // Extract snippet
         let snippet = if let Some(snip_start) = block.find("class=\"result__snippet\"") {
             let after_snip = &block[snip_start..];
             if let Some(tag_end) = after_snip.find('>') {
@@ -288,9 +317,7 @@ fn parse_ddg_html(html: &str) -> Vec<(String, String, String)> {
     results
 }
 
-/// Extract actual URL from DuckDuckGo's redirect URL.
 fn extract_ddg_url(raw: &str) -> String {
-    // DDG URLs look like: //duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com&...
     if let Some(uddg_start) = raw.find("uddg=") {
         let encoded = &raw[uddg_start + 5..];
         let encoded = if let Some(amp) = encoded.find('&') {
@@ -308,7 +335,6 @@ fn extract_ddg_url(raw: &str) -> String {
     }
 }
 
-/// Simple percent-decoding for URLs.
 fn url_decode(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.bytes();
@@ -333,7 +359,6 @@ fn url_decode(s: &str) -> String {
     result
 }
 
-/// Strip HTML tags from a string, decode basic entities.
 fn strip_html_tags(s: &str) -> String {
     let mut result = String::new();
     let mut in_tag = false;
@@ -345,7 +370,6 @@ fn strip_html_tags(s: &str) -> String {
             _ => {}
         }
     }
-    // Decode common HTML entities
     result
         .replace("&amp;", "&")
         .replace("&lt;", "<")

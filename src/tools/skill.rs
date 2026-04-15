@@ -1,8 +1,9 @@
-use crate::tools::{Tool, ToolContext, ToolResult};
+use crate::tools::{PermissionClass, Tool, ToolContext, ToolOutput};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 pub struct SkillTool;
 
@@ -11,19 +12,26 @@ const SKILL_COMMIT: &str = include_str!("../skills/commit.md");
 const SKILL_REVIEW_PR: &str = include_str!("../skills/review-pr.md");
 const SKILL_SIMPLIFY: &str = include_str!("../skills/simplify.md");
 
-#[async_trait]
-impl Tool for SkillTool {
-    fn name(&self) -> &str {
-        "Skill"
-    }
+const DESCRIPTION: &str = "Execute a skill within the main conversation\n\n\
+When users ask you to perform tasks, check if any of the available skills match. Skills provide specialized capabilities and domain knowledge.\n\n\
+When users reference a \"slash command\" or \"/<something>\" (e.g., \"/commit\", \"/review-pr\"), they are referring to a skill. Use this tool to invoke it.\n\n\
+How to invoke:\n\
+- Use this tool with the skill name and optional arguments\n\
+- Examples:\n\
+  - `skill: \"pdf\"` - invoke the pdf skill\n\
+  - `skill: \"commit\", args: \"-m 'Fix bug'\"` - invoke with arguments\n\
+  - `skill: \"review-pr\", args: \"123\"` - invoke with arguments\n\n\
+Important:\n\
+- Available skills are listed in system-reminder messages in the conversation\n\
+- When a skill matches the user's request, this is a BLOCKING REQUIREMENT: invoke the relevant Skill tool BEFORE generating any other response about the task\n\
+- NEVER mention a skill without actually calling this tool\n\
+- Do not invoke a skill that is already running\n\
+- Do not use this tool for built-in CLI commands (like /help, /clear, etc.)\n\
+- If you see a <command-name> tag in the current conversation turn, the skill has ALREADY been loaded - follow the instructions directly instead of calling this tool again";
 
-    fn description(&self) -> String {
-        "Execute a named skill (slash command). Skills provide specialized prompts \
-         for common workflows like committing, reviewing PRs, or simplifying code."
-            .to_string()
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
+fn schema() -> &'static serde_json::Value {
+    static CELL: OnceLock<serde_json::Value> = OnceLock::new();
+    CELL.get_or_init(|| {
         json!({
             "type": "object",
             "properties": {
@@ -38,13 +46,28 @@ impl Tool for SkillTool {
             },
             "required": ["skill"]
         })
+    })
+}
+
+#[async_trait]
+impl Tool for SkillTool {
+    fn name(&self) -> &'static str {
+        "Skill"
     }
 
-    fn is_read_only(&self, _input: &serde_json::Value) -> bool {
-        true // The skill itself is just a prompt expansion
+    fn description(&self) -> &'static str {
+        DESCRIPTION
     }
 
-    async fn call(&self, input: serde_json::Value, context: &ToolContext) -> Result<ToolResult> {
+    fn input_schema(&self) -> &'static serde_json::Value {
+        schema()
+    }
+
+    fn permission(&self, _input: &serde_json::Value) -> PermissionClass {
+        PermissionClass::ReadOnly
+    }
+
+    async fn call(&self, input: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
         let skill_name = input["skill"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'skill' parameter"))?;
@@ -56,7 +79,7 @@ impl Tool for SkillTool {
             || skill_name.contains("..")
             || skill_name.is_empty()
         {
-            return Ok(ToolResult::error(format!(
+            return Ok(ToolOutput::error(format!(
                 "Invalid skill name '{skill_name}'. Skill names must be simple identifiers (no path separators)."
             )));
         }
@@ -78,7 +101,7 @@ impl Tool for SkillTool {
 
         if skill_content.is_empty() {
             let available = list_available_skills(context).await;
-            return Ok(ToolResult::error(format!(
+            return Ok(ToolOutput::error(format!(
                 "Unknown skill '{skill_name}'. Available skills: {}",
                 available.join(", ")
             )));
@@ -102,7 +125,9 @@ impl Tool for SkillTool {
             expanded.push_str(&format!("\n\nArguments: {args}"));
         }
 
-        Ok(ToolResult::success(expanded))
+        Ok(ToolOutput::success()
+            .with_summary(format!("loaded skill '{skill_name}'"))
+            .with_text(expanded))
     }
 }
 

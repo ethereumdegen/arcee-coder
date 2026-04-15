@@ -7,6 +7,7 @@ pub mod glob;
 pub mod grep;
 pub mod lsp;
 pub mod notebook_edit;
+pub mod output;
 pub mod path_safety;
 pub mod plan_mode;
 pub mod read;
@@ -22,10 +23,12 @@ pub mod web_search;
 pub mod worktree;
 pub mod write;
 
-use crate::api::client::ApiClient;
+pub use output::{ToolBody, ToolOutput, Truncation};
+
 use crate::api::types::ToolDefinition;
 use crate::config::Config;
 use crate::permissions::PermissionMode;
+use crate::provider::Provider;
 use crate::tools::background_tasks::BackgroundTaskStore;
 use crate::tools::lsp::LspManager;
 use crate::tools::task_store::TaskStore;
@@ -36,11 +39,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// Simplified tool info for building API definitions.
-pub struct ToolDefInfo {
-    pub name: String,
-    pub description: String,
-    pub parameters: serde_json::Value,
+/// Permission class reported by a tool for the engine to enforce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionClass {
+    /// Always allowed (pure read).
+    ReadOnly,
+    /// Requires an "ask" prompt unless the permission mode bypasses it.
+    Ask,
+    /// Always denied.
+    Forbidden,
+}
+
+impl PermissionClass {
+    pub fn is_read_only(self) -> bool {
+        matches!(self, PermissionClass::ReadOnly)
+    }
 }
 
 /// Context provided to tools during execution.
@@ -50,94 +63,104 @@ pub struct ToolContext {
     pub permission_mode: Arc<Mutex<PermissionMode>>,
     pub task_store: Arc<Mutex<TaskStore>>,
     pub background_tasks: Arc<Mutex<BackgroundTaskStore>>,
-    pub api_client: Arc<ApiClient>,
+    pub provider: Arc<dyn Provider>,
     pub config: Config,
     pub lsp_manager: Arc<Mutex<LspManager>>,
     pub plan_file_path: Arc<Mutex<Option<PathBuf>>>,
 }
 
-/// Result returned by a tool execution.
-#[derive(Debug, Clone)]
-pub struct ToolResult {
-    pub content: String,
-    pub is_error: bool,
-}
-
-impl ToolResult {
-    pub fn success(content: impl Into<String>) -> Self {
-        Self {
-            content: content.into(),
-            is_error: false,
-        }
-    }
-
-    pub fn error(content: impl Into<String>) -> Self {
-        Self {
-            content: content.into(),
-            is_error: true,
-        }
-    }
-}
-
-/// The core Tool trait that all tools implement.
+/// Core `Tool` trait. All tools implement this.
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Unique name of this tool.
-    fn name(&self) -> &str;
+    fn name(&self) -> &'static str;
 
     /// Human-readable description for the model.
-    fn description(&self) -> String;
+    fn description(&self) -> &'static str;
 
-    /// JSON Schema for the tool's input parameters.
-    fn input_schema(&self) -> serde_json::Value;
+    /// JSON Schema for the tool's input parameters. Returns a `&'static`
+    /// reference backed by `OnceLock` so definitions can be cached at
+    /// registration time without per-turn allocation.
+    fn input_schema(&self) -> &'static serde_json::Value;
 
-    /// Whether this tool only reads (doesn't modify) state.
-    fn is_read_only(&self, _input: &serde_json::Value) -> bool {
-        false
+    /// Classify the tool's permission requirement based on the concrete
+    /// input. Default: `Ask`. Read-only tools should override to return
+    /// `PermissionClass::ReadOnly`.
+    fn permission(&self, _input: &serde_json::Value) -> PermissionClass {
+        PermissionClass::Ask
     }
 
     /// Execute the tool with the given input.
-    async fn call(&self, input: serde_json::Value, context: &ToolContext) -> Result<ToolResult>;
+    async fn call(&self, input: serde_json::Value, context: &ToolContext) -> Result<ToolOutput>;
 }
 
 /// Registry of all available tools.
+///
+/// At registration time the `definitions` vector is rebuilt once and reused
+/// for every turn — fixing the O(N) per-turn rebuild that the previous
+/// implementation incurred.
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
+    definitions_cache: Vec<ToolDefinition>,
+    names_cache: Vec<String>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            definitions_cache: Vec::new(),
+            names_cache: Vec::new(),
         }
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         self.tools.insert(tool.name().to_string(), tool);
+        self.rebuild_caches();
+    }
+
+    fn rebuild_caches(&mut self) {
+        let mut defs: Vec<_> = self
+            .tools
+            .values()
+            .map(|tool| {
+                ToolDefinition::new(
+                    tool.name().to_string(),
+                    tool.description().to_string(),
+                    tool.input_schema().clone(),
+                )
+            })
+            .collect();
+        defs.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+        self.definitions_cache = defs;
+
+        let mut names: Vec<_> = self.tools.keys().cloned().collect();
+        names.sort();
+        self.names_cache = names;
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools.get(name).map(|t| t.as_ref())
     }
 
-    pub fn definitions(&self) -> Vec<ToolDefinition> {
-        let mut defs: Vec<_> = self
-            .tools
-            .values()
-            .map(|tool| ToolDefinition::new(
-                tool.name(),
-                tool.description(),
-                tool.input_schema(),
-            ))
-            .collect();
-        defs.sort_by(|a, b| a.function.name.cmp(&b.function.name));
-        defs
+    /// Return the cached tool definitions. O(1) — does not rebuild per turn.
+    pub fn definitions(&self) -> &[ToolDefinition] {
+        &self.definitions_cache
     }
 
-    pub fn tool_names(&self) -> Vec<String> {
-        let mut names: Vec<_> = self.tools.keys().cloned().collect();
-        names.sort();
-        names
+    /// Clone the definitions when the API layer needs an owned Vec.
+    pub fn definitions_cloned(&self) -> Vec<ToolDefinition> {
+        self.definitions_cache.clone()
+    }
+
+    pub fn tool_names(&self) -> &[String] {
+        &self.names_cache
+    }
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

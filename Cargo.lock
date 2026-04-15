@@ -87,6 +87,7 @@ name = "arcee-code"
 version = "2.3.0"
 dependencies = [
  "anyhow",
+ "arcee-derive",
  "async-trait",
  "bytes",
  "chrono",
@@ -115,6 +116,15 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "arcee-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

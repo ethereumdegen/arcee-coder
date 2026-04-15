@@ -1,9 +1,9 @@
-use crate::api::client::ApiClient;
 use crate::config::Config;
 use crate::engine::cost::CostTracker;
 use crate::engine::model_router::Intensity;
 use crate::messages::types::Message;
 use crate::permissions::PermissionStrictness;
+use crate::provider::Provider;
 use std::fmt::Write;
 
 /// Result of a slash command.
@@ -22,7 +22,7 @@ pub async fn handle_command(
     messages: &mut Vec<Message>,
     cost_tracker: &CostTracker,
     config: &mut Config,
-    client: &ApiClient,
+    provider: &dyn Provider,
 ) -> CommandResult {
     let model = config.model.as_str();
     let parts: Vec<&str> = input.trim().splitn(2, ' ').collect();
@@ -39,7 +39,7 @@ pub async fn handle_command(
             let before = messages.len();
             let tokens_before = crate::engine::compact::estimate_tokens(messages);
             *messages = crate::engine::compact::compact_messages_ai(
-                client,
+                provider,
                 crate::engine::model_router::MODEL_LIGHT,
                 messages,
                 6,

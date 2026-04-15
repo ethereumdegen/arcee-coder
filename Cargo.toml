@@ -1,6 +1,9 @@
+[workspace]
+members = ["arcee-derive"]
+
 [package]
 name = "arcee-code"
-version = "2.3.0"
+version = "2.4.0"
 edition = "2024"
 description = "An AI coding assistant CLI, powered by Arcee AI"
 
@@ -9,6 +12,7 @@ name = "arcee"
 path = "src/main.rs"
 
 [dependencies]
+arcee-derive = { path = "arcee-derive" }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["stream", "json"] }
 serde = { version = "1", features = ["derive"] }

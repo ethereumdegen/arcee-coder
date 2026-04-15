@@ -88,7 +88,7 @@ fn default_max_tokens() -> u32 {
 }
 
 fn default_auto_routing() -> bool {
-    true
+    false
 }
 
 impl Default for Config {

@@ -1,22 +1,20 @@
 use crate::tools::path_safety::resolve_and_validate;
-use crate::tools::{Tool, ToolContext, ToolResult};
+use crate::tools::{Tool, ToolContext, ToolOutput};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
+use std::sync::OnceLock;
 
 pub struct NotebookEditTool;
 
-#[async_trait]
-impl Tool for NotebookEditTool {
-    fn name(&self) -> &str {
-        "NotebookEdit"
-    }
+const DESCRIPTION: &str = "Completely replaces the contents of a specific cell in a Jupyter notebook (.ipynb file) with new source. \
+Jupyter notebooks are interactive documents that combine code, text, and visualizations, commonly used for data analysis and scientific computing. \
+The notebook_path parameter must be an absolute path, not a relative path. The cell_number is 0-indexed. \
+Use edit_mode=insert to add a new cell at the index specified by cell_number. Use edit_mode=delete to delete the cell at the index specified by cell_number.";
 
-    fn description(&self) -> String {
-        "Edit a Jupyter notebook (.ipynb file). Can replace, insert, or delete cells.".to_string()
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
+fn schema() -> &'static serde_json::Value {
+    static CELL: OnceLock<serde_json::Value> = OnceLock::new();
+    CELL.get_or_init(|| {
         json!({
             "type": "object",
             "properties": {
@@ -34,18 +32,39 @@ impl Tool for NotebookEditTool {
                 },
                 "cell_type": {
                     "type": "string",
-                    "description": "Cell type: 'code' or 'markdown'. Required for insert."
+                    "description": "Cell type: 'code' or 'markdown'. Required for insert.",
+                    "enum": ["code", "markdown"]
                 },
                 "edit_mode": {
                     "type": "string",
-                    "description": "Edit mode: 'replace' (default), 'insert', or 'delete'"
+                    "description": "The type of edit to make (replace, insert, delete). Defaults to replace.",
+                    "enum": ["replace", "insert", "delete"]
+                },
+                "cell_id": {
+                    "type": "string",
+                    "description": "The ID of the cell to edit. When inserting a new cell, the new cell will be inserted after the cell with this ID."
                 }
             },
             "required": ["notebook_path", "new_source"]
         })
+    })
+}
+
+#[async_trait]
+impl Tool for NotebookEditTool {
+    fn name(&self) -> &'static str {
+        "NotebookEdit"
     }
 
-    async fn call(&self, input: serde_json::Value, context: &ToolContext) -> Result<ToolResult> {
+    fn description(&self) -> &'static str {
+        DESCRIPTION
+    }
+
+    fn input_schema(&self) -> &'static serde_json::Value {
+        schema()
+    }
+
+    async fn call(&self, input: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
         let notebook_path_str = input["notebook_path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'notebook_path' parameter"))?;
@@ -59,11 +78,11 @@ impl Tool for NotebookEditTool {
 
         let notebook_path = match resolve_and_validate(notebook_path_str, &context.cwd) {
             Ok(p) => p,
-            Err(e) => return Ok(ToolResult::error(e)),
+            Err(e) => return Ok(ToolOutput::error(e)),
         };
 
         if !notebook_path.exists() && edit_mode != "insert" {
-            return Ok(ToolResult::error(format!(
+            return Ok(ToolOutput::error(format!(
                 "Notebook not found: {}",
                 notebook_path.display()
             )));
@@ -125,7 +144,7 @@ impl Tool for NotebookEditTool {
             "replace" => {
                 let idx = cell_number.unwrap_or(0);
                 if idx >= cells.len() {
-                    return Ok(ToolResult::error(format!(
+                    return Ok(ToolOutput::error(format!(
                         "Cell index {idx} out of range (notebook has {} cells)",
                         cells.len()
                     )));
@@ -158,7 +177,7 @@ impl Tool for NotebookEditTool {
             "delete" => {
                 let idx = cell_number.unwrap_or(0);
                 if idx >= cells.len() {
-                    return Ok(ToolResult::error(format!(
+                    return Ok(ToolOutput::error(format!(
                         "Cell index {idx} out of range (notebook has {} cells)",
                         cells.len()
                     )));
@@ -166,7 +185,7 @@ impl Tool for NotebookEditTool {
                 cells.remove(idx);
             }
             _ => {
-                return Ok(ToolResult::error(format!(
+                return Ok(ToolOutput::error(format!(
                     "Invalid edit_mode '{edit_mode}'. Must be 'replace', 'insert', or 'delete'."
                 )));
             }
@@ -176,18 +195,22 @@ impl Tool for NotebookEditTool {
         let output = serde_json::to_string_pretty(&notebook)?;
         tokio::fs::write(&notebook_path, output).await?;
 
-        Ok(ToolResult::success(format!(
-            "Notebook {}: {} cell at index {} ({} total cells)",
-            notebook_path.display(),
-            match edit_mode {
-                "replace" => "replaced",
-                "insert" => "inserted",
-                "delete" => "deleted",
-                _ => edit_mode,
-            },
-            cell_number.unwrap_or(0),
-            notebook["cells"].as_array().map_or(0, |c| c.len())
-        )))
+        let verb = match edit_mode {
+            "replace" => "replaced",
+            "insert" => "inserted",
+            "delete" => "deleted",
+            _ => edit_mode,
+        };
+        let cell_count = notebook["cells"].as_array().map_or(0, |c| c.len());
+        let idx = cell_number.unwrap_or(0);
+        Ok(ToolOutput::success()
+            .with_summary(format!(
+                "{verb} cell {idx} ({cell_count} total cells)"
+            ))
+            .with_text(format!(
+                "Notebook {}: {verb} cell at index {idx}",
+                notebook_path.display()
+            )))
     }
 }
 
